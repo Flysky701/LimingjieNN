@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "difficulty": 5,
+  "to_max_unit_attr": true,
+  "is_auto_mode": true,
+  "is_set_mode": false,
+  "is_seman_mode": false,
+  "use_fixed_random_seed": false,
+  "random_seed": 666,
+  "use_all_enhance_nodes": true,
+  "fill_max_account_training_from_db": true,
+  "talent_skill_levels_override": {},
+  "talent_skill_node_levels_override": {},
+  "role_mastery_override": {},
+  "adaptive_repeat": {
+    "initial_runs": 1,
+    "borderline_runs": 6,
+    "borderline_min_win_rate": 0.15,
+    "borderline_max_win_rate": 0.85,
+    "high_rng_keywords": ["反物质兽", "狙击·遗物", "黄蜂女王", "美空"]
+  },
+  "exclude_environment_enemy_ids": [770900101, 770900201, 770900301, 770900401, 770900501],
+  "server_release_url": "https://github.com/cc004/PCRCalculator/releases/download/v2.11.0/PCRCalculator-2.11.0-server-linux.zip",
+  "pcr_version_data": {
+    "CharacterVersionJP": 10066000,
+    "BossVersionJP": 10066000,
+    "BossVersionCN": 202611131613,
+    "useQA": false,
+    "useJP": false,
+    "newAB": false,
+    "useLatestProd": false
+  },
+  "discover_latest_version_data": {
+    "CharacterVersionJP": 10066000,
+    "BossVersionJP": 10066000,
+    "BossVersionCN": 0,
+    "useQA": false,
+    "useJP": false,
+    "newAB": false,
+    "useLatestProd": true
+  },
+  "timeout_sec": 120.0,
+  "max_retries": 2
+}

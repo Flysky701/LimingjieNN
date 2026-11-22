@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "round_id": "round0_pilot",
+  "difficulty": 5,
+  "target_battles": 25000,
+  "max_full_target_battles": 150000,
+  "batch_size": 32,
+  "chunk_size": 5000,
+  "concurrency": 2,
+  "seed": 20261122,
+  "quest_type_weights": {
+    "normal": 0.25,
+    "robot_ex": 0.22,
+    "special_dual_ex": 0.13,
+    "other_ex": 0.15,
+    "boss_3f_d5": 0.10,
+    "boss_5f_d5": 0.15
+  },
+  "team_mix_weights": {
+    "prior": 0.35,
+    "counter_stratified": 0.25,
+    "perturb": 0.25,
+    "random": 0.15
+  },
+  "guild_weights": {
+    "3": 0.55,
+    "1": 0.25,
+    "2": 0.08,
+    "4": 0.06,
+    "5": 0.06
+  },
+  "area_state_distributions": {
+    "1": {"owned_min": 8, "owned_max": 18, "relic_min": 0, "relic_max": 5, "gold_min": 0, "gold_max": 4500},
+    "2": {"owned_min": 14, "owned_max": 26, "relic_min": 3, "relic_max": 10, "gold_min": 500, "gold_max": 7500},
+    "3": {"owned_min": 20, "owned_max": 35, "relic_min": 6, "relic_max": 16, "gold_min": 500, "gold_max": 11000},
+    "4": {"owned_min": 24, "owned_max": 45, "relic_min": 10, "relic_max": 22, "gold_min": 2000, "gold_max": 12000},
+    "5": {"owned_min": 28, "owned_max": 55, "relic_min": 14, "relic_max": 30, "gold_min": 0, "gold_max": 12000}
+  },
+  "boundary_probe_probabilities": {
+    "mark_threshold_focus": 0.40,
+    "owned_25_boundary": 0.20,
+    "gold_10k_boundary": 0.25,
+    "empty_relic_early": 0.05
+  }
+}

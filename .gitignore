@@ -1,0 +1,31 @@
+# Databases & generated data
+*.db
+*.sqlite
+*.sqlite3
+/data/
+/runs/
+/artifacts/
+/output/
+/tmp_*
+*.jsonl
+*.parquet
+*.onnx
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+/dist/
+/build/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
