@@ -21,8 +21,12 @@ from uuid import uuid4
 from labyrinth_nn.data import s0_preburn
 from labyrinth_nn.data.sample_schema import OUTCOME_TIMEOUT, SingleRunResult, write_samples
 from labyrinth_nn.data.sampler import QUEST_BUCKETS, quest_stratum
-from tests.test_catalog_and_data import NORMAL, ROOT, FixtureCase, mock_server
-from tests.test_critic_and_onnx import battle, tiny_catalog
+try:
+    from tests.test_catalog_and_data import NORMAL, ROOT, FixtureCase, mock_server
+    from tests.test_critic_and_onnx import battle, tiny_catalog
+except ModuleNotFoundError:
+    from test_catalog_and_data import NORMAL, ROOT, FixtureCase, mock_server
+    from test_critic_and_onnx import battle, tiny_catalog
 
 
 def reject_json_constant(value):
@@ -497,7 +501,17 @@ class RepositoryHygieneTests(unittest.TestCase):
                 self.assertNotIn(b"\r\n", path.read_bytes())
 
     def test_colab_pipeline_code_cells_are_python(self):
+        self.assertTrue((ROOT / "tests" / "__init__.py").is_file())
+        setup_script = (ROOT / "scripts" / "colab_setup_simulator.sh").read_text(encoding="utf-8")
+        self.assertIn('PORT="${PCRCALC_PORT:-18080}"', setup_script)
+        self.assertIn("is already in use", setup_script)
+        self.assertIn("/simulate", setup_script)
+
         path = ROOT / "notebooks" / "colab_labyrinth_pipeline.ipynb"
+        raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("PORT = 8080", raw)
+        self.assertNotIn(":8080", raw)
+        self.assertIn("PORT = 18080", raw)
         notebook = json.loads(path.read_bytes())
         code_cells = [(i, cell) for i, cell in enumerate(notebook["cells"]) if cell["cell_type"] == "code"]
         self.assertTrue(code_cells)

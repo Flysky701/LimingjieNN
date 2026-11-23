@@ -9,7 +9,7 @@ set -euo pipefail
 #     --db-path /content/drive/MyDrive/LimingjieNN/master_cn.db \
 #     --db-version 202611131613 \
 #     --persistent-tar /content/drive/MyDrive/LimingjieNN/cache/persistent_offline_202611131613.tar \
-#     --port 8080
+#     --port 18080
 
 CACHE_DIR="${PCRCALC_CACHE_DIR:-/content/pcr_cache}"
 WORK_DIR="${PCRCALC_WORK_DIR:-}"
@@ -18,7 +18,7 @@ DB_SHA256="${PCRCALC_CN_DB_SHA256:-}"
 DB_VERSION="${PCRCALC_CN_VERSION:-202611131613}"
 CHAR_VERSION_JP="${PCRCALC_CHAR_VER_JP:-10066000}"
 BOSS_VERSION_JP="${PCRCALC_BOSS_VER_JP:-10066000}"
-PORT="${PCRCALC_PORT:-8080}"
+PORT="${PCRCALC_PORT:-18080}"
 HOST="${PCRCALC_HOST:-127.0.0.1}"
 RELEASE_URL="${PCRCALC_RELEASE_URL:-https://github.com/cc004/PCRCalculator/releases/download/v2.11.0/PCRCalculator-2.11.0-server-linux.zip}"
 DISCOVER_LATEST="false"
@@ -118,6 +118,13 @@ fi
 
 # 4) Stage the offline cache and locked CN DB on local storage.
 stop_server
+if python3 -c "import socket; s=socket.create_connection(('${HOST}', int('${PORT}')), 1); s.close()" >/dev/null 2>&1; then
+  echo "[error] ${HOST}:${PORT} is already in use by another process (Colab often occupies 8080). Pass a free port such as --port 18080." >&2
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :${PORT}" >&2 || true
+  fi
+  exit 1
+fi
 if [[ -L "$PCRCALC_PERSISTENT_DATA_PATH" ]]; then
   rm -f "$PCRCALC_PERSISTENT_DATA_PATH"
 fi
@@ -200,23 +207,41 @@ else
   export PCRCALC_VERSION_DATA="{\"CharacterVersionJP\":${CHAR_VERSION_JP},\"BossVersionJP\":${BOSS_VERSION_JP},\"BossVersionCN\":${DB_VERSION},\"useQA\":false,\"useJP\":false,\"newAB\":false,\"useLatestProd\":false}"
 fi
 
-# 6) Start headless server in background and wait until TCP port accepts HTTP
+# 6) Start headless server in background and wait until POST /simulate is served
 cd "$WORK_DIR"
 nohup ./PCRCalculatorServer --server --host "$HOST" --port "$PORT" >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
 
-echo "[setup] Waiting for PCRCalculatorServer (pid=$SERVER_PID) at http://$HOST:$PORT ..."
+echo "[setup] Waiting for PCRCalculatorServer (pid=$SERVER_PID) at http://$HOST:$PORT/simulate ..."
 for i in $(seq 1 120); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "[error] PCRCalculatorServer exited prematurely. Tail of $LOG_FILE:" >&2
     tail -n 60 "$LOG_FILE" >&2 || true
     exit 1
   fi
-  if python3 -c "import urllib.request; urllib.request.urlopen('http://${HOST}:${PORT}/', timeout=2)" >/dev/null 2>&1 ||
-     python3 -c "import socket; s=socket.create_connection(('${HOST}', ${PORT}), 2); s.close()" >/dev/null 2>&1; then
-    sleep 2
-    echo "[setup] PCRCalculatorServer ready at http://$HOST:$PORT (persistent=$PCRCALC_PERSISTENT_DATA_PATH)"
+  if READY_CODE="$(python3 -c '
+import http.client, sys, urllib.error, urllib.request
+url = f"http://{sys.argv[1]}:{sys.argv[2]}/simulate"
+req = urllib.request.Request(
+    url, method="POST", data=b"[]",
+    headers={"Content-Type": "application/json", "Accept": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req, timeout=3) as resp:
+        print(resp.status)
+        sys.exit(0)
+except urllib.error.HTTPError as exc:
+    with exc:
+        if exc.code in (404, 502, 503):
+            sys.exit(1)
+        print(exc.code)
+        sys.exit(0)
+except (OSError, urllib.error.URLError, http.client.HTTPException):
+    sys.exit(1)
+' "$HOST" "$PORT" 2>/dev/null)"; then
+    sleep 1
+    echo "[setup] PCRCalculatorServer ready at http://$HOST:$PORT (POST /simulate -> HTTP $READY_CODE, persistent=$PCRCALC_PERSISTENT_DATA_PATH)"
     exit 0
   fi
   sleep 2

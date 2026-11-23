@@ -83,7 +83,7 @@ python -m labyrinth_nn.data.s0_preburn verify-data \
 
 ### Phase 1 · 特征目录与模拟器口径对账
 
-1. 将持久缓存归档打包至 Drive，再一次性解包到本地 SSD。已经有归档时复用原件，锁定的 `master_cn.db` 始终覆盖归档中的同名 DB。
+1. 将持久缓存归档打包至 Drive，再一次性解包到本地 SSD。已经有归档时复用原件，锁定的 `master_cn.db` 始终覆盖归档中的同名 DB（默认使用 `18080` 端口以避开 Colab 内置 `8080` 服务）。
 
 ```bash
 persistent_tar="$CACHE_DIR/persistent_offline_${CN_DB_VERSION}.tar"
@@ -92,7 +92,7 @@ if [[ ! -f "$persistent_tar" ]]; then
 fi
 bash scripts/colab_setup_simulator.sh \
   --cache-dir "$CACHE_DIR" --persistent-tar "$persistent_tar" \
-  --db-path "$CN_DB_PATH" --db-version "$CN_DB_VERSION" --port 8080
+  --db-path "$CN_DB_PATH" --db-version "$CN_DB_VERSION" --port 18080
 ```
 
 2. 首次缺少特征目录时，从国服锁库提取。进入 S1 前核对目录并冻结该文件。
@@ -109,7 +109,7 @@ fi
 python -m labyrinth_nn.data.probe_simulator \
   --catalog "$DATA_DIR/feature_pack.json" \
   --profile configs/sim_profile_highscore_cn.json \
-  --url http://127.0.0.1:8080 --bench-count 64 > "$DATA_DIR/probe_round0.json"
+  --url http://127.0.0.1:18080 --bench-count 64 > "$DATA_DIR/probe_round0.json"
 ```
 
 **验收门禁**：目录包含 `db_version`、`catalog_sha256`、`units`、`enemies`、`quests`、`relics`。探针退出码为 0，JSON 的 `passed` 为 `true`，16 项全部通过并记录 `benchmark.sims_per_sec`。
@@ -129,7 +129,7 @@ python -m labyrinth_nn.data.sampler \
 python -m labyrinth_nn.data.sampler \
   --catalog "$DATA_DIR/feature_pack.json" \
   --profile configs/sim_profile_highscore_cn.json --sampling configs/sampling_round0.json \
-  --url http://127.0.0.1:8080 --out /tmp/limingjienn-samples/round0_pilot.jsonl \
+  --url http://127.0.0.1:18080 --out /tmp/limingjienn-samples/round0_pilot.jsonl \
   --target-battles 25000 --batch-size 16 --concurrency 1 --timeout-sec 120 \
   --sync-dir "$DATA_DIR" --max-seconds 10800 --progress --isolate-errors --resume
 ```
@@ -221,7 +221,7 @@ for name, rep in reports.items():
 - **训练中断恢复**：使用 `--auto-resume --split-seed 42` 和原有配置、种子列表、完整训练分片及输出目录，按各配置和种子的 `last.pt` 续训。
 
 ```bash
-bash scripts/colab_setup_simulator.sh --port 8080 --stop-only
+bash scripts/colab_setup_simulator.sh --port 18080 --stop-only
 python -m labyrinth_nn.data.s0_preburn update-receipt \
   --receipt "$STATUS_DIR/latest_receipt.json" --locked-commit "$LOCKED_COMMIT" \
   --current-stage S0 --stage-name S0 \
@@ -267,13 +267,13 @@ python -m labyrinth_nn.data.s0_preburn update-receipt \
 # CPU Runtime
 python -m labyrinth_nn.data.s0_preburn cpu-cost \
   --catalog "$DATA_DIR/feature_pack.json" --profile configs/sim_profile_round1_cn.json \
-  --sampling configs/sampling_round1.json --url http://127.0.0.1:8080 \
+  --sampling configs/sampling_round1.json --url http://127.0.0.1:18080 \
   --probe-bench-count 64 --probe-out "$DATA_DIR/probe_round1.json" \
   --warmup-rows 8 --rows 200 --batch-size 8 --concurrency 1 --timeout-sec 120 \
-  --sim-log /tmp/pcr_calc_server_8080.log --cpu-cc-per-hour 0.08 \
+  --sim-log /tmp/pcr_calc_server_18080.log --cpu-cc-per-hour 0.08 \
   --out "$STATUS_DIR/s0_cpu_cost.json"
 cat "$STATUS_DIR/s0_cpu_cost.json"
-bash scripts/colab_setup_simulator.sh --port 8080 --stop-only
+bash scripts/colab_setup_simulator.sh --port 18080 --stop-only
 
 # 切换至 T4 GPU Runtime 后，重跑 Cell 1 并按 Phase 0 重建 pilot_shards 数组。
 python -m labyrinth_nn.data.s0_preburn t4-timing \
@@ -292,10 +292,10 @@ cat "$STATUS_DIR/s0_t4_timing.json"
 python -m labyrinth_nn.data.sampler \
   --catalog "$DATA_DIR/feature_pack.json" \
   --profile configs/sim_profile_round1_cn.json --sampling configs/sampling_round1.json \
-  --url http://127.0.0.1:8080 --out /tmp/limingjienn-samples/round1_scale.jsonl \
+  --url http://127.0.0.1:18080 --out /tmp/limingjienn-samples/round1_scale.jsonl \
   --target-battles 125000 --batch-size 16 --concurrency 1 --timeout-sec 120 \
   --sync-dir "$DATA_DIR" --max-seconds 10800 --progress --isolate-errors --resume
-bash scripts/colab_setup_simulator.sh --port 8080 --stop-only
+bash scripts/colab_setup_simulator.sh --port 18080 --stop-only
 
 # S2 T4 GPU Runtime。先用 Cell 6 校验每个 TRAIN_PREFIXES 条目的 manifest 和 SHA256。
 python -m labyrinth_nn.train.train_critic \
