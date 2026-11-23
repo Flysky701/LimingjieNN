@@ -10,13 +10,16 @@ import unittest
 from dataclasses import replace
 from importlib.util import find_spec
 from pathlib import Path
+from unittest.mock import patch
 
 from labyrinth_nn.catalog.schema import (
     ENEMY_STATIC_FEAT_NAMES, GLOBAL_FEAT_NAMES, TEAM_SYNERGY_FEAT_NAMES, UNIT_STATIC_FEAT_NAMES,
     EnemyEntry, FeatureCatalog, QuestEntry, RelicEntry, ScoreSettings, UnitEntry,
 )
-from labyrinth_nn.data.dataset import BattleDataset, build_vocab_maps, collate_battle_batch, featurize_sample, split_samples
-from labyrinth_nn.data.sample_schema import BattleSample
+from labyrinth_nn.data.dataset import (
+    BattleDataset, build_vocab_maps, collate_battle_batch, featurize_sample, mask_gold_sample, split_samples,
+)
+from labyrinth_nn.data.sample_schema import BattleSample, write_samples_jsonl
 from labyrinth_nn.train.metrics import EVAL_BUCKETS, compute_slice_metrics, evaluate_predictions
 
 HAS_TORCH = find_spec("torch") is not None
@@ -30,6 +33,7 @@ if HAS_TORCH:
         TwoTowerBattleCritic, TwoTowerEnsemble,
     )
     from labyrinth_nn.train.losses import compute_critic_loss, fit_temperature
+    from labyrinth_nn.train import train_critic as training
     from labyrinth_nn.train.train_critic import run_experiments, split_training_samples, train_critic
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
@@ -85,6 +89,19 @@ class FeatureTests(unittest.TestCase):
 
     def features(self, sample, **options):
         return featurize_sample(self.catalog, sample, **self.maps, **options)
+
+    def test_counterfactual_gold_is_masked_before_features(self):
+        sample = battle(context_id="paired", relic_ids=[503, 999])
+        known = self.features(sample)
+        gold_unknown = self.features(mask_gold_sample(sample))
+        synergy = TEAM_SYNERGY_FEAT_NAMES.index("gold_x_gold_relic")
+        self.assertGreater(known["team_synergy"][synergy], 0)
+        self.assertEqual(gold_unknown["team_synergy"][synergy], 0)
+        self.assertEqual(sample.alpha_rupee, 8000)
+        self.assertFalse(gold_unknown["gold_known"])
+        self.assertTrue(gold_unknown["has_gold_scaling_relic"])
+        self.assertEqual(gold_unknown["context_id"], "paired")
+        self.assertFalse(self.features(sample, training=True, relic_id_mask_prob=1)["has_gold_scaling_relic"])
 
     def test_slots_signed_distance_ties_and_padding(self):
         sample = battle(team_unit_ids=[104, 102, 101, 103, 102, 0])
@@ -218,6 +235,30 @@ class FeatureTests(unittest.TestCase):
 
 
 class MetricTests(unittest.TestCase):
+    def test_context_top1_ranking_and_gold_scaling_relic_slice(self):
+        def row(context, team, p, y, *, relic):
+            return {"context_id": context, "team_sig": team, "canonical_wave_sig": "shared-wave",
+                    "bucket": "normal", "gold_known": False, "has_gold_scaling_relic": relic,
+                    "pred_probs": [p, 1-p, 0], "target_probs": [y, 1-y, 0],
+                    "pred_damage_mean": 0.8, "target_damage_ratio": 0.5, "has_win_target": False}
+        rows = [
+            row("a", "1", 0.8, 0.25, relic=True), row("a", "2", 0.6, 1.0, relic=True),
+            row("b", "1", 0.4, 0.75, relic=False), row("b", "3", 0.3, 0.0, relic=False),
+            row("incomplete", "1", 0.9, 0.0, relic=True), row("incomplete", "1", 0.8, 0.2, relic=True),
+        ]
+        metrics = evaluate_predictions(rows)
+        self.assertEqual(metrics["global"]["context_count"], 2)
+        self.assertEqual(metrics["global"]["context_top1_fpr"], 0.5)
+        self.assertEqual(metrics["global"]["context_top1_pos_fpr"], 1.0)
+        self.assertEqual(metrics["global"]["context_top1_win_regret"], 0.375)
+        relic = metrics["slices"]["gold_scaling_relic"]
+        self.assertEqual((relic["count"], relic["context_count"], relic["context_top1_win_regret"]), (4, 1, 0.75))
+        empty = metrics["buckets"]["other_ex"]
+        self.assertEqual(empty["context_count"], 0)
+        self.assertIsNone(empty["context_top1_fpr"])
+        self.assertIsNone(empty["context_top1_pos_fpr"])
+        self.assertIsNone(empty["context_top1_win_regret"])
+
     def test_soft_calibration_ranking_and_slices(self):
         def record(wave, team, p, y, damage, time, bucket, gold):
             return {"canonical_wave_sig": wave, "team_sig": team, "pred_probs": p, "target_probs": y,
@@ -272,6 +313,127 @@ class TorchTests(unittest.TestCase):
     def batch(self, samples):
         return collate_battle_batch([featurize_sample(self.catalog, s, **self.maps, roster_max_len=16,
                                                      relic_max_len=8) for s in samples])
+
+    def test_eval_cache_and_epoch_seeded_training_features(self):
+        evaluation = BattleDataset(self.catalog, [battle()], cache_eval=True, gold_mask_prob=1)
+        with patch("labyrinth_nn.data.dataset.featurize_sample", wraps=featurize_sample) as featurize:
+            self.assertTrue(evaluation[0]["gold_known"])
+            evaluation.set_epoch(2)
+            self.assertTrue(evaluation[0]["gold_known"])
+            self.assertEqual(featurize.call_count, 1)
+        training_data = BattleDataset(self.catalog, [battle()], training=True, cache_eval=True,
+                                      unit_id_dropout=0.5, relic_id_mask_prob=0.5, gold_mask_prob=0.5)
+        first = training_data[0]
+        self.assertEqual(first, training_data[0])
+        training_data.set_epoch(1)
+        self.assertNotEqual(first, training_data[0])
+        training_data.set_epoch(0)
+        self.assertEqual(first, training_data[0])
+
+    def test_damage_modes_mask_wins_and_detach_nll_mean(self):
+        config = self.config("m2b_r1")
+        model = TwoTowerBattleCritic(config)
+        with torch.no_grad():
+            model.tower_b.damage_log_std.weight.zero_()
+            model.tower_b.damage_log_std.bias.fill_(-9)
+        batch = self.batch([battle(outcome_counts=[2, 1, 1]), battle(outcome_counts=[0, 3, 1])])
+        outputs = model(batch)
+        torch.testing.assert_close(outputs["damage_log_std"], torch.full((2, 1), -2.5))
+        outputs["damage_log_std"] = torch.full((2, 1), -2.5, requires_grad=True)
+        masked, parts = compute_critic_loss(outputs, batch, config)
+        huber, huber_parts = compute_critic_loss(outputs, batch, replace(config, damage_loss_mode="huber_only"))
+        mean_grad, var_grad = torch.autograd.grad(
+            masked, (outputs["damage_mean"], outputs["damage_log_std"]), retain_graph=True,
+        )
+        huber_mean_grad, huber_var_grad = torch.autograd.grad(
+            huber, (outputs["damage_mean"], outputs["damage_log_std"]), retain_graph=True,
+        )
+        torch.testing.assert_close(mean_grad, huber_mean_grad)
+        self.assertEqual(mean_grad[0].item(), 0)
+        self.assertEqual(var_grad[0].item(), 0)
+        self.assertNotEqual(var_grad[1].item(), 0)
+        self.assertEqual(huber_var_grad.count_nonzero().item(), 0)
+        self.assertEqual(huber_parts["damage_nll"].item(), 0)
+        error = batch["mean_damage_ratio"][1] - outputs["damage_mean"][1].detach()
+        expected = 0.5 * (error.square() / math.exp(-5) - 5)
+        self.assertAlmostEqual(parts["damage_nll"].item(), expected.item(), places=5)
+        only_wins = self.batch([battle(outcome_counts=[1, 0, 0])])
+        for mode in ("masked_nll", "huber_only"):
+            win_outputs = model(only_wins)
+            loss, components = compute_critic_loss(win_outputs, only_wins, replace(config, damage_loss_mode=mode))
+            self.assertEqual(components["damage_loss"].item(), 0)
+            grads = torch.autograd.grad(loss, (win_outputs["damage_mean"], win_outputs["damage_log_std"]))
+            self.assertTrue(all(g.count_nonzero().item() == 0 for g in grads))
+        for invalid in ({"damage_log_std_min": 1}, {"damage_loss_mode": "other"}, {"lr_schedule": "other"}):
+            with self.assertRaises(ValueError):
+                replace(config, **invalid)
+
+    def test_cosine_resume_gradient_clip_components_and_counterfactual_reports(self):
+        config = replace(self.config("m2b_r1"), epochs=3, batch_size=4, val_ratio=0.25, test_ratio=0.25,
+                         warmup_ratio=0.4)
+        samples = [
+            battle(sample_id=f"s-{i}", context_id=f"context-{i // 2}", canonical_wave_sig=f"wave-{i // 2}",
+                   team_unit_ids=[101, 102, 103, 104, 105 + i % 2], outcome_counts=[0, 2, 0] if i % 2 else [2, 0, 0],
+                   mean_win_rem_time=None if i % 2 else 0.5)
+            for i in range(32)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(torch.nn.utils, "clip_grad_norm_", wraps=torch.nn.utils.clip_grad_norm_) as clip:
+                summary = run_experiments([config], self.catalog, samples, root / "full", device="cpu",
+                                          group_by="context")
+                self.assertGreater(clip.call_count, config.epochs)
+                self.assertTrue(all(call.args[1] == 1.0 for call in clip.call_args_list))
+            mode = summary["modes"]["m2b_r1"]
+            run = mode["runs"][0]
+            history = run["history"]
+            for row in history:
+                for key in (*training.LOSS_COMPONENTS, "lr"):
+                    self.assertTrue(math.isfinite(row[key]), key)
+            self.assertLess(history[0]["lr"], history[1]["lr"])
+            self.assertLess(history[2]["lr"], history[1]["lr"])
+            checkpoint = torch.load(run["checkpoint"], map_location="cpu", weights_only=True)
+            self.assertAlmostEqual(checkpoint["optimizer"]["param_groups"][0]["lr"], config.lr * config.min_lr_ratio)
+            test_report = json.loads(Path(run["checkpoint"]).with_name("test_metrics.json").read_text(encoding="utf-8"))
+            masked = test_report["counterfactual_gold_unknown"]
+            self.assertEqual(masked["global"]["count"], run["split_counts"]["test"])
+            self.assertEqual(masked["slices"]["gold_scaling_relic"]["count"], masked["global"]["count"])
+            self.assertGreater(masked["global"]["context_count"], 0)
+            self.assertEqual(run["metrics"]["slices"]["gold_unknown"]["count"], 0)
+            saved_summary = json.loads((root / "full" / "ablation_summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_summary["modes"]["m2b_r1"]["counterfactual_gold_unknown"], masked)
+            markdown = (root / "full" / "ablation_summary.md").read_text(encoding="utf-8")
+            self.assertIn("| gold_unknown_cf |", markdown)
+            self.assertIn("| gold_unknown_cf_gold_relic |", markdown)
+
+            save = training._save_checkpoint
+
+            def interrupt_after_epoch(path, payload):
+                save(path, payload)
+                raise KeyboardInterrupt
+
+            with patch.object(training, "_save_checkpoint", side_effect=interrupt_after_epoch):
+                with self.assertRaises(KeyboardInterrupt):
+                    train_critic(config, self.catalog, samples, root / "partial", device="cpu", group_by="context")
+            resumed = train_critic(config, self.catalog, samples, root / "resumed", device="cpu",
+                                   resume=root / "partial" / "last.pt", group_by="context")
+            self.assertEqual(resumed["history"], history)
+            self.assertTrue(all(not row["gold_known"] for row in resumed["counterfactual_predictions"]))
+            self.assertEqual(resumed["counterfactual_gold_unknown"], masked)
+
+    def test_cli_rejects_duplicate_ids_and_mixed_db_versions_across_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = write_samples_jsonl(root / "first.jsonl", [battle()])
+            second = root / "second.jsonl"
+            args = ["--config-files", str(CONFIG_DIR / "critic_m2b_r1.json"), "--catalog", str(root / "catalog.json"),
+                    "--out-dir", str(root / "fit"), "--samples", str(first), str(second)]
+            write_samples_jsonl(second, [battle()])
+            with self.assertRaisesRegex(ValueError, "duplicate sample_id: s1"):
+                training.main(args)
+            write_samples_jsonl(second, [battle(sample_id="s2", db_version="other")])
+            with self.assertRaisesRegex(ValueError, "mixed db_version"):
+                training.main(args)
 
     def test_four_modes_forward_backward_and_exact_wrapper_inputs(self):
         samples = [battle(team_unit_ids=[102, 101, 105], relic_ids=[], area=1000, mean_win_rem_time=1.0),

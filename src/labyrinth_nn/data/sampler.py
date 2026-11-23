@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -11,8 +12,10 @@ import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from heapq import nlargest
-from itertools import islice
+from itertools import combinations, islice
+from math import comb
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,11 @@ QUEST_BUCKETS = ("normal", "robot_ex", "special_dual_ex", "other_ex", "boss_3f_d
 TEAM_MODES = ("prior", "counter_stratified", "perturb", "random")
 OWNED_BOUNDARY = (24, 25, 26)
 GOLD_BOUNDARY = (9999, 10000, 10001)
+UNSUPPORTED_LINK = {errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOSYS}
+
+
+def _identity_hash(identity: tuple) -> str:
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def quest_stratum(quest: QuestEntry) -> str | None:
@@ -72,6 +80,15 @@ class HighScoreSampler:
         if len(catalog.units) < 5:
             raise ValueError("sampling requires at least five catalog units")
         self.unit_ids = catalog.sorted_unit_ids()
+        self.paired_teams = int(config.get("paired_teams_per_context", 1))
+        self.underfull_prob = float(config.get("underfull_team_prob", 0.0))
+        self._pending_teams: list[tuple[BattleSample, str]] = []
+        if self.paired_teams < 1 or not 0 <= self.underfull_prob <= 1:
+            raise ValueError("invalid paired team count or underfull team probability")
+        self.min_owned = next((n for n in range(5, len(self.unit_ids) + 1)
+                               if comb(n, 5) >= self.paired_teams), None)
+        if self.min_owned is None:
+            raise ValueError("catalog cannot supply enough distinct five-unit teams per context")
         environment = environment_enemy_ids(catalog, profile)
         self.quest_enemies = {
             qid: [catalog.enemies[eid] for eid in quest.enemy_ids if eid not in environment and eid in catalog.enemies]
@@ -133,11 +150,15 @@ class HighScoreSampler:
         self.borderline_runs = int(repeat.get("borderline_runs", 6))
         self.min_win_rate = float(repeat.get("borderline_min_win_rate", 0.15))
         self.max_win_rate = float(repeat.get("borderline_max_win_rate", 0.85))
+        self.close_loss_damage = repeat.get("close_loss_damage_threshold")
+        self.close_win_time = repeat.get("close_win_rem_time_threshold")
+        self.random_repeat_prob = float(repeat.get("random_repeat_prob", 0.0))
         self.rng_keywords = tuple(str(word) for word in repeat.get(
             "high_rng_keywords", ("反物质兽", "狙击·遗物", "黄蜂女王", "美空")
         ) if word)
         if not (1 <= self.initial_runs <= self.borderline_runs
-                and 0 <= self.min_win_rate <= self.max_win_rate <= 1):
+                and 0 <= self.min_win_rate <= self.max_win_rate <= 1
+                and 0 <= self.random_repeat_prob <= 1):
             raise ValueError("invalid adaptive repeat settings")
 
     def _scaling_guilds(self, field: str) -> set[int]:
@@ -245,10 +266,35 @@ class HighScoreSampler:
                 count = min(len(others), self.rng.randint(1, 2))
                 for slot, uid in zip(self.rng.sample(range(5), count), self.rng.sample(others, count)):
                     team[slot] = uid
-        return sorted(team, key=lambda uid: (units[uid].search_area_width, uid))
+        if self.underfull_prob and len(owned) >= 3 and self.rng.random() < self.underfull_prob:
+            team = self.rng.sample(team, self.rng.choice((3, 4)))
+        return self._sort_team(team)
+
+    def _sort_team(self, team: Iterable[int]) -> list[int]:
+        return sorted(team, key=lambda uid: (self.catalog.units[uid].search_area_width, uid))
+
+    def _sample_id(self, context: tuple, team: list[int]) -> str:
+        db_hash, quest_id, difficulty, guild_id, owned, relics, gold = context
+        return _identity_hash((self.round_id, db_hash, quest_id, difficulty, guild_id, team, owned, relics, gold))
+
+    def _prior(self, mode: str, quest: QuestEntry) -> list[int]:
+        if mode not in {"prior", "perturb"}:
+            return []
+        ids = self.priors.get(str(quest.quest_id), self.priors.get(quest.bucket, ()))
+        return list(dict.fromkeys(uid for value in ids if (uid := int(value)) in self.catalog.units))[:5]
+
+    def _context_identity(self, quest_id, guild_id, owned, relics, gold) -> tuple:
+        return (self.catalog.db_sha256 or self.catalog.catalog_sha256, quest_id, 5, guild_id, owned, relics, gold)
 
     def draw(self) -> tuple[BattleSample, str]:
         """Draw one state and report the selected team policy for planning statistics."""
+        if self.paired_teams == 1:
+            return self._draw_first_team()
+        if not self._pending_teams:
+            self._pending_teams = self._draw_context()[::-1]
+        return self._pending_teams.pop()
+
+    def _draw_first_team(self) -> tuple[BattleSample, str]:
         bucket = _choice(self.rng, self.quest_weights)
         empty = bool(self.early_quests[bucket]) and self.rng.random() < min(
             1.0, self.boundary["empty_relic_early"] / self.early_mass
@@ -270,24 +316,20 @@ class HighScoreSampler:
         ):
             gold = self.rng.choice(GOLD_BOUNDARY)
 
-        prior: list[int] = []
-        if mode in {"prior", "perturb"}:
-            ids = self.priors.get(str(quest.quest_id), self.priors.get(quest.bucket, ()))
-            prior = list(dict.fromkeys(uid for value in ids if (uid := int(value)) in self.catalog.units))[:5]
+        prior = self._prior(mode, quest)
         required = [guild.guild_master_id] if guild.guild_master_id in self.catalog.units else []
         required = list(dict.fromkeys(required + prior))
-        owned_count = min(len(self.unit_ids), max(5, len(required), owned_count))
+        owned_count = min(len(self.unit_ids), max(self.min_owned, len(required), owned_count))
         owned = sorted(required + self.rng.sample(
             [uid for uid in self.unit_ids if uid not in required], owned_count - len(required)
         ))
         team = self._team(mode, quest, owned, prior)
         roles = Counter(self.catalog.units[uid].role_id for uid in owned)
         talents = Counter(self.catalog.units[uid].talent_id for uid in owned)
-        identity = (self.round_id, self.catalog.db_sha256 or self.catalog.catalog_sha256,
-                    quest.quest_id, 5, guild.guild_id, team, owned, relic_ids, gold)
-        sample_id = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
+        context = self._context_identity(quest.quest_id, guild.guild_id, owned, relic_ids, gold)
         return BattleSample(
-            sample_id=sample_id, round_id=self.round_id, source="sim", db_version=self.catalog.db_version,
+            sample_id=self._sample_id(context, team), round_id=self.round_id, source="sim",
+            db_version=self.catalog.db_version,
             quest_id=quest.quest_id, canonical_wave_sig=quest.canonical_wave_sig, bucket=quest.bucket,
             area=quest.area, difficulty=5, guild_id=guild.guild_id,
             team_unit_ids=team, owned_unit_ids=owned, owned_unit_count=owned_count,
@@ -296,7 +338,34 @@ class HighScoreSampler:
             relic_ids=relic_ids, mark_stacks=self.catalog.mark_stacks_for_relics(relic_ids),
             alpha_rupee=gold,
             revive_available=any(self.catalog.relics[rid].is_revive for rid in relic_ids),
+            context_id=_identity_hash(context) if self.paired_teams > 1 else "",
         ), mode
+
+    def _draw_context(self) -> list[tuple[BattleSample, str]]:
+        first, mode = self._draw_first_team()
+        group = [(first, mode)]
+        quest = self.catalog.quests[first.quest_id]
+        owned = first.owned_unit_ids
+        context = self._context_identity(first.quest_id, first.guild_id, owned, first.relic_ids, first.alpha_rupee)
+        teams = {tuple(first.team_unit_ids)}
+        for _ in range(self.paired_teams - 1):
+            mode = _choice(self.rng, self.team_weights)
+            team = self._team(mode, quest, owned, self._prior(mode, quest))
+            if tuple(team) in teams:
+                mode = "random"
+                size = len(team)
+                # Preserve team size if that size still has unused combinations.
+                if sum(len(t) == size for t in teams) == comb(len(owned), size):
+                    size = 5
+                for _ in range(16):
+                    team = self._sort_team(self.rng.sample(owned, size))
+                    if tuple(team) not in teams:
+                        break
+                else:
+                    team = list(next(t for t in combinations(self._sort_team(owned), size) if t not in teams))
+            teams.add(tuple(team))
+            group.append((replace(first, team_unit_ids=team, sample_id=self._sample_id(context, team)), mode))
+        return group
 
     def _unique(self, count: int, seen: set[str]) -> Iterator[tuple[BattleSample, str]]:
         duplicates = 0
@@ -368,6 +437,16 @@ class HighScoreSampler:
         win_rate = sum(run.outcome_class == OUTCOME_WIN for run in sample.runs) / len(sample.runs)
         return self.min_win_rate <= win_rate <= self.max_win_rate or any(
             word in name for name in names for word in self.rng_keywords
+        ) or any(
+            (self.close_loss_damage is not None and run.outcome_class != OUTCOME_WIN
+             and run.damage_ratio >= self.close_loss_damage)
+            or (self.close_win_time is not None and run.outcome_class == OUTCOME_WIN
+                and run.rem_time_ratio <= self.close_win_time)
+            for run in sample.runs
+        ) or (
+            self.random_repeat_prob > 0
+            and int.from_bytes(hashlib.sha256(sample.sample_id.encode("utf-8")).digest()[:8])
+            < self.random_repeat_prob * 2**64
         )
 
     def simulate_samples(self, client: SimClient, samples: list[BattleSample]) -> list[BattleSample]:
@@ -392,7 +471,8 @@ class HighScoreSampler:
         return samples
 
     def collect(
-        self, client: SimClient, output: str | Path, target: int, *, resume: bool = False
+        self, client: SimClient, output: str | Path, target: int, *, resume: bool = False,
+        failure_log: str | Path | None = None,
     ) -> dict[str, int]:
         batch_size = int(self.config.get("batch_size", 32))
         chunk_size = int(self.config.get("chunk_size", 5000))
@@ -405,18 +485,26 @@ class HighScoreSampler:
         shards = _existing_shards(path)
         if shards and not resume:
             raise FileExistsError(f"output already exists, use --resume: {path}")
+        isolate = bool(self.config.get("isolate_batch_errors", False))
+        failed_path = Path(failure_log) if isolate and failure_log is not None else None
         seen: set[str] = set()
+        entries = []
         for shard in shards.values():
-            for sample in read_samples(shard):
+            rows = read_samples(shard)
+            for sample in rows:
                 if (sample.round_id, sample.db_version, sample.source) != (
                     self.round_id, self.catalog.db_version, "sim"
                 ):
                     raise ValueError(f"sample {sample.sample_id} in {shard} belongs to a different run")
                 seen.add(sample.sample_id)
+            entries.append(_shard_entry(shard, len(rows)))
         completed = len(seen)
-        written = 0
+        written = failed = 0
         index = max(shards, default=-1) + 1
         pending: list[BattleSample] = []
+        if resume and failed_path is not None and failed_path.is_file():
+            with failed_path.open(encoding="utf-8") as log:
+                seen.update(json.loads(line)["sample_id"] for line in log if line.strip())
         work = self._unique(max(0, target - completed), seen)
 
         def batches() -> Iterator[list[BattleSample]]:
@@ -425,28 +513,78 @@ class HighScoreSampler:
 
         def flush(count: int) -> None:
             nonlocal index, written
-            _write_shard(_shard_path(path, index), pending[:count])
+            shard = _shard_path(path, index)
+            _write_shard(shard, pending[:count])
+            entries.append(_shard_entry(shard, count))
             del pending[:count]
             written += count
             index += 1
 
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            stream = batches()
+        def simulate(batch: list[BattleSample]) -> tuple[list[BattleSample], list[dict[str, str]]]:
             try:
+                return self.simulate_samples(client, batch), []
+            except SimulationError as exc:
+                if not isolate:
+                    raise
+                if len(batch) == 1:
+                    return [], [{"sample_id": batch[0].sample_id, "error": str(exc)}]
+                mid = len(batch) // 2
+                left, left_errors = simulate(batch[:mid])
+                right, right_errors = simulate(batch[mid:])
+                return left + right, left_errors + right_errors
+
+        try:
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                stream = batches()
                 while window := list(islice(stream, concurrency)):
-                    futures = [pool.submit(self.simulate_samples, client, batch) for batch in window]
+                    futures = [pool.submit(simulate, batch) for batch in window]
                     for future in futures:
-                        pending.extend(future.result())
+                        valid, errors = future.result()
+                        pending.extend(valid)
+                        failed += len(errors)
+                        if errors and failed_path is not None:
+                            failed_path.parent.mkdir(parents=True, exist_ok=True)
+                            with failed_path.open("a", encoding="utf-8") as log:
+                                for error in errors:
+                                    log.write(json.dumps(error, ensure_ascii=False) + "\n")
                         while len(pending) >= chunk_size:
                             flush(chunk_size)
-            except (SimulationError, KeyboardInterrupt):
-                if pending:
-                    flush(len(pending))
-                raise
+        except (SimulationError, KeyboardInterrupt):
+            if pending:
+                flush(len(pending))
+            self._write_manifest(path, entries, completed + written)
+            raise
         if pending:
             flush(len(pending))
-        return {"existing_battles": completed, "new_battles": written, "total_battles": completed + written,
-                "new_shards": index - max(shards, default=-1) - 1}
+        self._write_manifest(path, entries, completed + written)
+        result = {"existing_battles": completed, "new_battles": written, "total_battles": completed + written,
+                  "new_shards": index - max(shards, default=-1) - 1}
+        if isolate:
+            result["failed_battles"] = failed
+        return result
+
+    def _write_manifest(self, path: Path, entries: list[dict[str, Any]], total: int) -> None:
+        manifest = path.with_name(f"{path.stem}.manifest.json")
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "shards": entries, "total_unique_battles": total, "round_id": self.round_id,
+            "db_version": self.catalog.db_version,
+            "catalog_sha256": self.catalog.catalog_sha256 or self.catalog.compute_sha256(),
+        }
+        with tempfile.NamedTemporaryFile(dir=manifest.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+        try:
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8", newline="\n")
+            os.replace(temporary, manifest)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _shard_entry(path: Path, rows: int) -> dict[str, Any]:
+    with path.open("rb") as f:
+        digest = hashlib.file_digest(f, "sha256").hexdigest()
+    return {"filename": path.name, "row_count": rows, "sha256": digest}
 
 
 def _shard_path(base: Path, index: int) -> Path:
@@ -476,7 +614,14 @@ def _write_shard(path: Path, samples: list[BattleSample]) -> None:
     try:
         write_samples(temporary, samples)
         # Publish the completed shard atomically and fail if another writer won the race.
-        os.link(temporary, path)
+        try:
+            os.link(temporary, path)
+        except OSError as exc:
+            if exc.errno not in UNSUPPORTED_LINK:
+                raise
+            if path.exists():
+                raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path) from exc
+            os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -520,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", default="http://127.0.0.1:8080")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--target-battles", "--count", type=int)
+    parser.add_argument("--seed", type=int, help="sampling seed for this worker")
+    parser.add_argument("--round-id", help="round identifier for this worker")
+    parser.add_argument("--chunk-size", type=int)
+    parser.add_argument("--isolate-errors", action="store_true", help="quarantine samples that fail simulation")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", type=int, metavar="N")
     args = parser.parse_args(argv)
@@ -529,6 +678,11 @@ def main(argv: list[str] | None = None) -> int:
         catalog = FeatureCatalog.load(args.catalog)
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         config = json.loads(args.sampling.read_text(encoding="utf-8"))
+        for name in ("seed", "round_id", "chunk_size"):
+            if (value := getattr(args, name)) is not None:
+                config[name] = value
+        if args.isolate_errors:
+            config["isolate_batch_errors"] = True
         sampler = HighScoreSampler(catalog, profile, config)
         if args.dry_run is not None:
             result = sampler.dry_run(args.dry_run)
@@ -536,7 +690,10 @@ def main(argv: list[str] | None = None) -> int:
             target = args.target_battles if args.target_battles is not None else int(config.get("target_battles", 25000))
             if target > int(config.get("max_full_target_battles", 150000)):
                 raise ValueError("target exceeds max_full_target_battles")
-            result = sampler.collect(SimClient(args.url, catalog, profile), args.out, target, resume=args.resume)
+            result = sampler.collect(
+                SimClient(args.url, catalog, profile), args.out, target, resume=args.resume,
+                failure_log=args.out.with_name(f"{args.out.stem}.failed.jsonl"),
+            )
     except (ImportError, OSError, ValueError, SimulationError) as exc:
         parser.exit(1, f"sampling failed: {exc}\n")
     print(json.dumps(result, ensure_ascii=False, indent=2))

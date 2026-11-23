@@ -17,9 +17,24 @@ def compute_critic_loss(outputs, batch, config: CriticConfig) -> tuple[Tensor, d
     mean = outputs["damage_mean"].float().reshape(-1)
     log_std = outputs["damage_log_std"].float().reshape(-1)
     damage_target = batch["mean_damage_ratio"].float().reshape_as(mean)
-    huber = F.huber_loss(mean, damage_target)
-    variance = torch.exp(2 * log_std)
-    gaussian = 0.5 * ((damage_target - mean).square() / variance + 2 * log_std).mean()
+    if config.damage_loss_mode == "legacy":
+        huber = F.huber_loss(mean, damage_target)
+        variance = torch.exp(2 * log_std)
+        gaussian = 0.5 * ((damage_target - mean).square() / variance + 2 * log_std).mean()
+    else:
+        non_win = target[:, OUTCOME_WIN] < 0.5
+        if non_win.any():
+            huber = F.huber_loss(mean[non_win], damage_target[non_win])
+            if config.damage_loss_mode == "masked_nll":
+                loss_log_std = log_std[non_win]
+                variance = torch.exp(2 * loss_log_std)
+                residual = damage_target[non_win] - mean[non_win].detach()
+                gaussian = 0.5 * (residual.square() / variance + 2 * loss_log_std).mean()
+            else:
+                gaussian = 0.0 * log_std.sum()
+        else:
+            huber = 0.0 * mean.sum()
+            gaussian = 0.0 * log_std.sum()
     damage = huber + gaussian
 
     time_pred = outputs["win_rem_time"].float().reshape(-1)

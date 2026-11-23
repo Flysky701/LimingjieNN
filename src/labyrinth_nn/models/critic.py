@@ -61,6 +61,12 @@ class CriticConfig:
     damage_loss_weight: float = 1.0
     time_loss_weight: float = 0.25
     affinity_loss_weight: float = 0.1
+    damage_log_std_min: float = -5.0
+    damage_loss_mode: str = "legacy"
+    grad_clip_norm: float = 0.0
+    lr_schedule: str = "constant"
+    warmup_ratio: float = 0.0
+    min_lr_ratio: float = 0.02
 
     def __post_init__(self):
         if self.n_heads <= 0 or self.d_model <= 0 or self.d_model % self.n_heads:
@@ -70,6 +76,14 @@ class CriticConfig:
             raise ValueError("vocabularies, roster capacity, embedding tables and layer counts must be positive")
         if self.relic_max_len < 0:
             raise ValueError("relic_max_len must be nonnegative")
+        if self.damage_loss_mode not in ("legacy", "masked_nll", "huber_only"):
+            raise ValueError("damage_loss_mode must be legacy, masked_nll or huber_only")
+        if self.lr_schedule not in ("constant", "cosine"):
+            raise ValueError("lr_schedule must be constant or cosine")
+        if not self.damage_log_std_min < 1.0:
+            raise ValueError("damage_log_std_min must be less than 1.0")
+        if not (0 <= self.warmup_ratio < 1 and 0 <= self.min_lr_ratio <= 1):
+            raise ValueError("warmup_ratio must be in [0, 1) and min_lr_ratio in [0, 1]")
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any], catalog: FeatureCatalog | None = None) -> CriticConfig:
@@ -251,7 +265,8 @@ class SlotAwareTeamHead(nn.Module):
                                  team_synergy[:, gap + 1:]), dim=1)
             parts.append(self.synergy_proj(synergy.to(self.synergy_proj.weight.dtype)))
         fused = self.fusion(torch.cat(parts, dim=-1))
-        return (self.outcome(fused), self.damage_mean(fused), self.damage_log_std(fused).clamp(-5.0, 1.0),
+        return (self.outcome(fused), self.damage_mean(fused),
+                self.damage_log_std(fused).clamp(self.config.damage_log_std_min, 1.0),
                 torch.sigmoid(self.time(fused)))
 
 

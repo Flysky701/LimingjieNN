@@ -1,6 +1,7 @@
 """Unified battle sample schema supporting JSONL (stdlib) and optional Parquet."""
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -53,9 +54,17 @@ class BattleSample:
     outcome_counts: list[int] = field(default_factory=lambda: [0, 0, 0])
     mean_damage_ratio: float = 0.0
     mean_win_rem_time: float | None = None
+    context_id: str = ""
 
     def canonical_team_sig(self) -> str:
         return ",".join(str(uid) for uid in sorted(self.team_unit_ids))
+
+    def physical_state_key(self) -> str:
+        identity = (
+            self.db_version, self.quest_id, self.difficulty, self.guild_id,
+            sorted(self.team_unit_ids), sorted(self.owned_unit_ids), sorted(self.relic_ids), self.alpha_rupee,
+        )
+        return hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +91,7 @@ class BattleSample:
             "outcome_counts": list(self.outcome_counts),
             "mean_damage_ratio": float(self.mean_damage_ratio),
             "mean_win_rem_time": self.mean_win_rem_time,
+            "context_id": self.context_id,
         }
 
     @classmethod
@@ -114,6 +124,7 @@ class BattleSample:
             outcome_counts=[int(x) for x in raw["outcome_counts"]],
             mean_damage_ratio=float(raw["mean_damage_ratio"]),
             mean_win_rem_time=None if raw.get("mean_win_rem_time") is None else float(raw["mean_win_rem_time"]),
+            context_id=str(raw.get("context_id") or ""),
         )
 
 

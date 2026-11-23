@@ -33,6 +33,8 @@ class _Record:
     team: str
     bucket: str
     gold: bool
+    context_id: str = ""
+    has_gold_scaling_relic: bool = False
 
     @classmethod
     def read(cls, row: Mapping[str, Any]) -> _Record:
@@ -47,7 +49,8 @@ class _Record:
         if _scalar(row["has_win_target"]):
             time = abs(_scalar(row["pred_win_rem_time"]) - _scalar(row["target_win_rem_time"]))
         return cls(pred, target, damage, time, str(row["canonical_wave_sig"]),
-                   str(row.get("team_sig", "")), str(row["bucket"]), bool(_scalar(row["gold_known"])))
+                   str(row.get("team_sig", "")), str(row["bucket"]), bool(_scalar(row["gold_known"])),
+                   str(row.get("context_id") or ""), bool(_scalar(row.get("has_gold_scaling_relic", False))))
 
 
 def _auc(rows: list[_Record]) -> float | None:
@@ -71,11 +74,16 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _rank(row: _Record) -> tuple[float, str]:
+    return -row.pred[0], row.team
+
+
 def _metrics(rows: list[_Record]) -> dict[str, int | float | None]:
     n = len(rows)
     win_brier = full_brier = correct = 0.0
     bin_residual = [0.0] * 15
     top: dict[str, _Record] = {}
+    contexts: dict[str, list[_Record]] = defaultdict(list)
     for row in rows:
         pred, target = row.pred, row.target
         full_brier += sum((p - y) ** 2 for p, y in zip(pred, target))
@@ -83,8 +91,18 @@ def _metrics(rows: list[_Record]) -> dict[str, int | float | None]:
         correct += max(range(3), key=pred.__getitem__) == max(range(3), key=target.__getitem__)
         bin_residual[min(14, max(0, int(pred[0] * 15)))] += pred[0] - target[0]
         previous = top.get(row.wave)
-        if previous is None or (-pred[0], row.team) < (-previous.pred[0], previous.team):
+        if previous is None or _rank(row) < _rank(previous):
             top[row.wave] = row
+        if row.context_id:
+            contexts[row.context_id].append(row)
+    context_top = []
+    regrets = []
+    for group in contexts.values():
+        distinct = len({row.team for row in group if row.team}) + sum(not row.team for row in group)
+        if distinct >= 2:
+            chosen = min(group, key=_rank)
+            context_top.append(chosen)
+            regrets.append(max(r.target[0] for r in group) - chosen.target[0])
     return {
         "count": n, "auroc": _auc(rows),
         "brier_3class": full_brier / n if n else None, "brier_win": win_brier / n if n else None,
@@ -94,6 +112,10 @@ def _metrics(rows: list[_Record]) -> dict[str, int | float | None]:
         "win_time_mae": _mean([r.time_error for r in rows if r.time_error is not None]),
         "group_top1_fpr": _mean([float(r.target[0] < 0.5) for r in top.values()]),
         "group_top1_pos_fpr": _mean([float(r.target[0] < 0.5) for r in top.values() if r.pred[0] >= 0.5]),
+        "context_count": len(context_top),
+        "context_top1_fpr": _mean([float(r.target[0] < 0.5) for r in context_top]),
+        "context_top1_pos_fpr": _mean([float(r.target[0] < 0.5) for r in context_top if r.pred[0] >= 0.5]),
+        "context_top1_win_regret": _mean(regrets),
     }
 
 
@@ -111,5 +133,8 @@ def evaluate_predictions(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]
         buckets[row.bucket].append(row)
     return {
         "global": _metrics(rows), "buckets": {name: _metrics(buckets[name]) for name in EVAL_BUCKETS},
-        "slices": {"gold_unknown": _metrics([row for row in rows if not row.gold])},
+        "slices": {
+            "gold_unknown": _metrics([row for row in rows if not row.gold]),
+            "gold_scaling_relic": _metrics([row for row in rows if row.has_gold_scaling_relic]),
+        },
     }

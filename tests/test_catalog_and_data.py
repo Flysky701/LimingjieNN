@@ -1,10 +1,12 @@
 """Worker A tests using SQLite, loopback HTTP and any local CN master copies."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
 import math
+import os
 import sqlite3
 import statistics
 import tempfile
@@ -17,11 +19,13 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import MappingProxyType
+from unittest.mock import patch
 
 from labyrinth_nn.catalog.build_catalog import build_catalog
 from labyrinth_nn.catalog.schema import ENEMY_STATIC_FEAT_NAMES, UNIT_MECH_FLAG_NAMES, UNIT_STATIC_FEAT_NAMES
 from labyrinth_nn.data import probe_simulator, sampler
-from labyrinth_nn.data.sample_schema import OUTCOME_TIMEOUT, OUTCOME_WIN, read_samples
+from labyrinth_nn.data.dataset import split_samples
+from labyrinth_nn.data.sample_schema import BattleSample, OUTCOME_TIMEOUT, OUTCOME_WIN, SingleRunResult, read_samples
 from labyrinth_nn.data.sim_client import (
     PcrCalculatorClient, SimClient, SimulationConfig, SimulationError, build_simulate_payload,
 )
@@ -609,6 +613,125 @@ class SimClientTests(FixtureCase):
 
 
 class SamplerTests(FixtureCase):
+    def test_sample_context_id_and_round_independent_physical_state(self):
+        sample, _ = sampler.HighScoreSampler(self.catalog, self.profile, self.config).draw()
+        legacy = sample.to_dict()
+        del legacy["context_id"]
+        self.assertEqual(BattleSample.from_dict(legacy), sample)
+        paired = replace(sample, context_id="shared", round_id="round1", sample_id="new-id",
+                         team_unit_ids=sample.team_unit_ids[::-1], owned_unit_ids=sample.owned_unit_ids[::-1],
+                         relic_ids=sample.relic_ids[::-1])
+        self.assertEqual(BattleSample.from_dict(paired.to_dict()), paired)
+        identity = (sample.db_version, sample.quest_id, sample.difficulty, sample.guild_id,
+                    sorted(sample.team_unit_ids), sorted(sample.owned_unit_ids), sorted(sample.relic_ids),
+                    sample.alpha_rupee)
+        expected = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
+        self.assertEqual(sample.physical_state_key(), expected)
+        self.assertEqual(paired.physical_state_key(), expected)
+        self.assertNotEqual(replace(paired, alpha_rupee=None).physical_state_key(), expected)
+
+    def test_round1_config_and_adaptive_repeat_triggers(self):
+        config = json.loads((ROOT / "configs/sampling_round1.json").read_text(encoding="utf-8"))
+        profile = json.loads((ROOT / "configs/sim_profile_round1_cn.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(config["guild_weights"]), set(map(str, range(1, 11))))
+        self.assertTrue(all(w > 0 for w in config["guild_weights"].values()))
+        for name in ("area_state_distributions", "boundary_probe_probabilities"):
+            self.assertEqual(config[name], self.config[name])
+        repeat = profile["adaptive_repeat"]
+        self.assertEqual((repeat["initial_runs"], repeat["borderline_runs"]), (2, 6))
+        planner = sampler.HighScoreSampler(self.catalog, profile, config)
+        base, _ = planner.draw()
+        loss = SingleRunResult(1, 2, OUTCOME_TIMEOUT, 5400, 90, 90, 0.0, 100, 0.5)
+        win = replace(loss, result=0, outcome_class=OUTCOME_WIN, damage_ratio=1.0, rem_time_ratio=0.5)
+        # SHA256("a") starts above the 0.15 cutoff; SHA256("d") starts below it.
+        base = replace(base, quest_id=NORMAL, sample_id="a")
+        for run, expected in ((loss, False), (win, False),
+                              (replace(loss, damage_ratio=0.75), True),
+                              (replace(win, rem_time_ratio=0.15), True)):
+            with self.subTest(run=run):
+                self.assertEqual(planner._needs_repeat(replace(base, runs=[run, run])), expected)
+        random_pick = replace(base, sample_id="d", runs=[loss, loss])
+        rng_before = planner.rng.getstate()
+        self.assertTrue(planner._needs_repeat(random_pick))
+        self.assertTrue(planner._needs_repeat(random_pick))
+        self.assertEqual(planner.rng.getstate(), rng_before)
+        legacy = sampler.HighScoreSampler(self.catalog, self.profile, self.config)
+        self.assertFalse(legacy._needs_repeat(random_pick))
+
+    def test_paired_contexts_underfull_teams_and_context_safe_split(self):
+        config = self.config | {"paired_teams_per_context": 4, "underfull_team_prob": 1.0,
+                                "team_mix_weights": {"prior": 1}}
+        planner = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        rows = [s for s, _ in planner._unique(40, set())]
+        self.assertEqual(len({s.sample_id for s in rows}), len(rows))
+        contexts = defaultdict(list)
+        for sample in rows:
+            self.assertTrue(sample.context_id)
+            self.assertIn(len(sample.team_unit_ids), (3, 4))
+            self.assertTrue(set(sample.team_unit_ids) <= set(sample.owned_unit_ids))
+            contexts[sample.context_id].append(sample)
+        self.assertEqual(len(contexts), 10)
+        for group in contexts.values():
+            self.assertEqual(len({s.canonical_team_sig() for s in group}), 4)
+            self.assertEqual(len({replace(s, team_unit_ids=[]).physical_state_key() for s in group}), 1)
+        split = split_samples(rows, val_ratio=0.2, test_ratio=0.2, group_by="context")
+        self.assertEqual([len(part) for part in split], [24, 8, 8])
+        sets = [{s.context_id for s in part} for part in split]
+        self.assertEqual(sum(map(len, sets)), len(set.union(*sets)))
+        fresh = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        self.assertEqual([s.sample_id for s in rows], [fresh.draw()[0].sample_id for _ in rows])
+
+    def test_batch_isolation_quarantine_resume_and_manifest(self):
+        config = self.config | {"isolate_batch_errors": True, "batch_size": 4, "chunk_size": 2}
+        planner = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        bad_id = list(planner._unique(2, set()))[-1][0].sample_id
+        path = self.root / "isolation.jsonl"
+        failure_log = self.root / "isolation.failed.jsonl"
+
+        def simulate(_client, batch):
+            if any(s.sample_id == bad_id for s in batch):
+                raise SimulationError("malformed battle result")
+            return batch
+
+        planner = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        with patch.object(planner, "simulate_samples", side_effect=simulate):
+            result = planner.collect(None, path, 4, failure_log=failure_log)
+        self.assertEqual((result["new_battles"], result["failed_battles"], result["new_shards"]), (3, 1, 2))
+        self.assertEqual([json.loads(line) for line in failure_log.read_text(encoding="utf-8").splitlines()],
+                         [{"sample_id": bad_id, "error": "malformed battle result"}])
+        resume = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        with patch.object(resume, "simulate_samples", side_effect=simulate):
+            result = resume.collect(None, path, 4, resume=True, failure_log=failure_log)
+        self.assertEqual((result["existing_battles"], result["new_battles"], result["failed_battles"]), (3, 1, 0))
+        manifest = json.loads((self.root / "isolation.manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["total_unique_battles"], 4)
+        self.assertEqual(manifest["round_id"], config["round_id"])
+        self.assertEqual(manifest["db_version"], self.catalog.db_version)
+        self.assertEqual(manifest["catalog_sha256"], self.catalog.catalog_sha256)
+        self.assertEqual([e["row_count"] for e in manifest["shards"]], [2, 1, 1])
+        ids = set()
+        for entry in manifest["shards"]:
+            shard = self.root / entry["filename"]
+            self.assertEqual(entry["sha256"], hashlib.sha256(shard.read_bytes()).hexdigest())
+            ids.update(sample.sample_id for sample in read_samples(shard))
+        self.assertEqual(len(ids), 4)
+        self.assertNotIn(bad_id, ids)
+
+    def test_shard_publish_fallback_checks_errno_and_existing_path(self):
+        path = self.root / "fallback.jsonl"
+        sample, _ = sampler.HighScoreSampler(self.catalog, self.profile, self.config).draw()
+        with patch.object(os, "link", side_effect=OSError(errno.EINVAL, "unsupported hardlink")):
+            sampler._write_shard(path, [sample])
+            with self.assertRaises(FileExistsError):
+                sampler._write_shard(path, [replace(sample, sample_id="must-not-overwrite")])
+        self.assertEqual(read_samples(path), [sample])
+        other = self.root / "fallback-error.jsonl"
+        with patch.object(os, "link", side_effect=OSError(errno.EIO, "I/O error")):
+            with self.assertRaisesRegex(OSError, "I/O error"):
+                sampler._write_shard(other, [sample])
+        self.assertFalse(other.exists())
+        self.assertFalse(list(self.root.glob(".fallback-*.jsonl")))
+
     def test_select_hard_negatives_ranks_prediction_errors_and_close_battles(self):
         base, _ = sampler.HighScoreSampler(self.catalog, self.profile, self.config).draw()
         samples = [

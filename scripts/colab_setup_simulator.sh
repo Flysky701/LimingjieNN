@@ -11,7 +11,7 @@ set -euo pipefail
 #     --port 8080
 
 CACHE_DIR="${PCRCALC_CACHE_DIR:-/content/pcr_cache}"
-WORK_DIR="${PCRCALC_WORK_DIR:-/tmp/pcr_calc_server}"
+WORK_DIR="${PCRCALC_WORK_DIR:-}"
 DB_PATH="${PCRCALC_CN_DB_PATH:-}"
 DB_SHA256="${PCRCALC_CN_DB_SHA256:-}"
 DB_VERSION="${PCRCALC_CN_VERSION:-202611131613}"
@@ -37,7 +37,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "$CACHE_DIR" "$WORK_DIR" "$CACHE_DIR/persistent"
+WORK_DIR="${WORK_DIR:-/tmp/pcr_calc_server_${PORT}}"
+PID_FILE="/tmp/pcr_calc_server_${PORT}.pid"
+LOG_FILE="/tmp/pcr_calc_server_${PORT}.log"
+export PCRCALC_PERSISTENT_DATA_PATH="/tmp/pcr_calc_persistent_${PORT}"
+mkdir -p "$CACHE_DIR" "$WORK_DIR" "$PCRCALC_PERSISTENT_DATA_PATH"
 
 # 1) Install minimal Ubuntu shared libs if missing (best-effort on Colab)
 if command -v apt-get >/dev/null 2>&1; then
@@ -51,8 +55,11 @@ ZIP_NAME="$(basename "$RELEASE_URL")"
 ZIP_PATH="$CACHE_DIR/$ZIP_NAME"
 if [[ ! -s "$ZIP_PATH" ]]; then
   echo "[setup] Downloading $RELEASE_URL -> $ZIP_PATH"
-  curl -fL --retry 3 --retry-delay 3 -o "${ZIP_PATH}.part" "$RELEASE_URL"
-  mv -f "${ZIP_PATH}.part" "$ZIP_PATH"
+  ZIP_TEMP="$(mktemp "${ZIP_PATH}.part.XXXXXX")"
+  trap 'rm -f "$ZIP_TEMP"' EXIT
+  curl -fL --retry 3 --retry-delay 3 -o "$ZIP_TEMP" "$RELEASE_URL"
+  mv -f "$ZIP_TEMP" "$ZIP_PATH"
+  trap - EXIT
 else
   echo "[setup] Reusing cached archive: $ZIP_PATH"
 fi
@@ -72,6 +79,10 @@ if [[ ! -x "$WORK_DIR/PCRCalculatorServer" ]]; then
 fi
 
 # 4) Verify & stage offline locked CN DB as prod<BossVersionCN>.db (per AssetManagerCN.DataVer)
+DB_NAME="prod${DB_VERSION}.db"
+if [[ -z "$DB_PATH" && ! -f "$PCRCALC_PERSISTENT_DATA_PATH/$DB_NAME" && -f "$CACHE_DIR/persistent/$DB_NAME" ]]; then
+  DB_PATH="$CACHE_DIR/persistent/$DB_NAME"
+fi
 if [[ -n "$DB_PATH" ]]; then
   if [[ ! -f "$DB_PATH" ]]; then
     echo "[error] Specified --db-path does not exist: $DB_PATH" >&2
@@ -85,34 +96,38 @@ if [[ -n "$DB_PATH" ]]; then
     fi
     echo "[setup] Verified CN DB SHA256: $ACTUAL_SHA"
   fi
-  cp -f "$DB_PATH" "$CACHE_DIR/persistent/prod${DB_VERSION}.db"
-  cp -f "$DB_PATH" "$WORK_DIR/prod${DB_VERSION}.db"
-  echo "[setup] Staged offline CN DB as prod${DB_VERSION}.db"
+fi
+
+# Stop any prior server on this port before staging its database.
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE")"
+  if [[ "$OLD_PID" =~ ^[1-9][0-9]*$ ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" || true
+    sleep 1
+  fi
+fi
+
+LOCAL_DB="$PCRCALC_PERSISTENT_DATA_PATH/$DB_NAME"
+if [[ -n "$DB_PATH" && ! "$DB_PATH" -ef "$LOCAL_DB" ]]; then
+  cp -f "$DB_PATH" "$LOCAL_DB"
+  echo "[setup] Staged offline CN DB as $DB_NAME"
+fi
+if [[ -f "$LOCAL_DB" && ! "$LOCAL_DB" -ef "$WORK_DIR/$DB_NAME" ]]; then
+  cp -f "$LOCAL_DB" "$WORK_DIR/$DB_NAME"
 fi
 
 # 5) Configure CN runtime environment (pinned offline version unless --discover-latest)
-export PCRCALC_PERSISTENT_DATA_PATH="$CACHE_DIR/persistent"
 if [[ "$DISCOVER_LATEST" == "true" ]]; then
   export PCRCALC_VERSION_DATA="{\"CharacterVersionJP\":${CHAR_VERSION_JP},\"BossVersionJP\":${BOSS_VERSION_JP},\"BossVersionCN\":0,\"useQA\":false,\"useJP\":false,\"newAB\":false,\"useLatestProd\":true}"
 else
   export PCRCALC_VERSION_DATA="{\"CharacterVersionJP\":${CHAR_VERSION_JP},\"BossVersionJP\":${BOSS_VERSION_JP},\"BossVersionCN\":${DB_VERSION},\"useQA\":false,\"useJP\":false,\"newAB\":false,\"useLatestProd\":false}"
 fi
 
-# Stop any prior server on the same port cleanly
-if [[ -f /tmp/pcr_calc_server.pid ]]; then
-  OLD_PID="$(cat /tmp/pcr_calc_server.pid || true)"
-  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    kill "$OLD_PID" || true
-    sleep 1
-  fi
-fi
-
 # 6) Start headless server in background and wait until TCP port accepts HTTP
-LOG_FILE="/tmp/pcr_calc_server.log"
 cd "$WORK_DIR"
 nohup ./PCRCalculatorServer --server --host "$HOST" --port "$PORT" >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!
-echo "$SERVER_PID" > /tmp/pcr_calc_server.pid
+echo "$SERVER_PID" > "$PID_FILE"
 
 echo "[setup] Waiting for PCRCalculatorServer (pid=$SERVER_PID) at http://$HOST:$PORT ..."
 for i in $(seq 1 120); do

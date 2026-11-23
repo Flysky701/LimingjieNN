@@ -6,6 +6,7 @@ import math
 import random
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 from labyrinth_nn.catalog.schema import (
@@ -201,20 +202,37 @@ def featurize_sample(
         "has_win_target": has_time, "sample_id": sample.sample_id, "quest_id": sample.quest_id,
         "canonical_wave_sig": sample.canonical_wave_sig, "team_sig": sample.canonical_team_sig(),
         "bucket": sample.bucket, "gold_known": gold_known,
+        "context_id": sample.context_id,
+        "has_gold_scaling_relic": any(
+            relic.gold_scaling for rid in visible_relic_ids if (relic := catalog.relics.get(rid)) is not None
+        ),
     }
 
 
+def mask_gold_sample(sample: BattleSample) -> BattleSample:
+    return replace(sample, alpha_rupee=None)
+
+
 def split_samples(samples: Sequence[BattleSample], val_ratio: float = 0.15,
-                  test_ratio: float = 0.15, seed: int = 42
+                  test_ratio: float = 0.15, seed: int = 42, group_by: str = "wave_team"
                   ) -> tuple[list[BattleSample], list[BattleSample], list[BattleSample]]:
     if not (0 <= val_ratio and 0 <= test_ratio and val_ratio + test_ratio < 1):
         raise ValueError("split ratios must be nonnegative and sum to less than one")
+    if group_by not in ("wave_team", "context", "wave"):
+        raise ValueError("group_by must be wave_team, context or wave")
     groups = defaultdict(list)
     for sample in samples:
-        groups[sample.canonical_wave_sig, sample.canonical_team_sig()].append(sample)
+        wave = sample.canonical_wave_sig
+        if group_by == "wave":
+            key = (wave,)
+        elif group_by == "context" and sample.context_id:
+            key = (sample.context_id,)
+        else:
+            key = (wave, sample.canonical_team_sig())
+        groups[key].append(sample)
 
-    def order(key: tuple[str, str]) -> tuple[str, tuple[str, str]]:
-        digest = hashlib.sha256(f"{seed}|{key[0]}|{key[1]}".encode("utf-8")).hexdigest()
+    def order(key: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
+        digest = hashlib.sha256(f"{seed}|{'|'.join(key)}".encode("utf-8")).hexdigest()
         return digest, key
 
     keys = sorted(groups, key=order)
@@ -225,7 +243,7 @@ def split_samples(samples: Sequence[BattleSample], val_ratio: float = 0.15,
     n_val = min(max(min_val, int(n * val_ratio)), max(0, n - 1 - n_test))
     cut = n - n_test - n_val
 
-    def flatten(selected: list[tuple[str, str]]) -> list[BattleSample]:
+    def flatten(selected: list[tuple[str, ...]]) -> list[BattleSample]:
         return [sample for key in selected for sample in groups[key]]
 
     return flatten(keys[:cut]), flatten(keys[cut:cut + n_val]), flatten(keys[cut + n_val:])
@@ -243,7 +261,7 @@ class BattleDataset:
     """Map-style PyTorch dataset. Noise is reproducible per epoch and sample index."""
 
     def __init__(self, catalog: FeatureCatalog, samples: Sequence[BattleSample], *,
-                 seed: int = 42, training: bool = False, **feature_options: Any):
+                 seed: int = 42, training: bool = False, cache_eval: bool = False, **feature_options: Any):
         _torch()
         self.catalog = catalog
         self.samples = samples
@@ -252,6 +270,7 @@ class BattleDataset:
         self.training = training
         self.seed = seed
         self.epoch = 0
+        self._eval_cache: dict[int, dict[str, Any]] | None = {} if cache_eval and not training else None
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
@@ -260,9 +279,14 @@ class BattleDataset:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if self._eval_cache is not None and index in self._eval_cache:
+            return self._eval_cache[index]
         rng = random.Random(f"{self.seed}|{self.epoch}|{index}") if self.training else None
-        return featurize_sample(self.catalog, self.samples[index], **self.maps, **self.options,
-                                training=self.training, rng=rng)
+        row = featurize_sample(self.catalog, self.samples[index], **self.maps, **self.options,
+                               training=self.training, rng=rng)
+        if self._eval_cache is not None:
+            self._eval_cache[index] = row
+        return row
 
 
 _INT_FIELDS = {"quest_idx", "area_idx", "difficulty_idx", "enemy_ids", "relic_ids",
