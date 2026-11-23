@@ -8,7 +8,10 @@ import json
 import os
 import random
 import re
+import shutil
+import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +24,9 @@ from typing import Any
 
 from labyrinth_nn.catalog.schema import MARK_THRESHOLDS, FeatureCatalog, GuildEntry, QuestEntry
 from labyrinth_nn.data.sample_schema import BattleSample, OUTCOME_WIN, aggregate_runs, read_samples, write_samples
-from labyrinth_nn.data.sim_client import SimClient, SimulationConfig, SimulationError, environment_enemy_ids
+from labyrinth_nn.data.sim_client import (
+    SimClient, SimulationConfig, SimulationError, SimulationTimeoutError, environment_enemy_ids,
+)
 
 QUEST_BUCKETS = ("normal", "robot_ex", "special_dual_ex", "other_ex", "boss_3f_d5", "boss_5f_d5")
 TEAM_MODES = ("prior", "counter_stratified", "perturb", "random")
@@ -472,8 +477,11 @@ class HighScoreSampler:
 
     def collect(
         self, client: SimClient, output: str | Path, target: int, *, resume: bool = False,
-        failure_log: str | Path | None = None,
-    ) -> dict[str, int]:
+        failure_log: str | Path | None = None, sync_dir: str | Path | None = None,
+        max_seconds: float | None = None, progress_stderr: bool = False,
+    ) -> dict[str, Any]:
+        if max_seconds is not None and max_seconds <= 0:
+            raise ValueError("max_seconds must be positive")
         batch_size = int(self.config.get("batch_size", 32))
         chunk_size = int(self.config.get("chunk_size", 5000))
         concurrency = int(self.config.get("concurrency", 1))
@@ -489,6 +497,7 @@ class HighScoreSampler:
         failed_path = Path(failure_log) if isolate and failure_log is not None else None
         seen: set[str] = set()
         entries = []
+        existing_subruns = 0
         for shard in shards.values():
             rows = read_samples(shard)
             for sample in rows:
@@ -497,19 +506,41 @@ class HighScoreSampler:
                 ):
                     raise ValueError(f"sample {sample.sample_id} in {shard} belongs to a different run")
                 seen.add(sample.sample_id)
+                existing_subruns += len(sample.runs)
             entries.append(_shard_entry(shard, len(rows)))
         completed = len(seen)
+        started = time.monotonic()
+        stopped_by_time_limit = False
+        new_subruns = repeated_battles = 0
+        buckets_new: Counter[str] = Counter()
+        guilds_new: Counter[int] = Counter()
+        sync_root = Path(sync_dir) if sync_dir is not None else None
+        manifest = path.with_name(f"{path.stem}.manifest.json")
+        synced_shards = 0
         written = failed = 0
         index = max(shards, default=-1) + 1
         pending: list[BattleSample] = []
         if resume and failed_path is not None and failed_path.is_file():
             with failed_path.open(encoding="utf-8") as log:
                 seen.update(json.loads(line)["sample_id"] for line in log if line.strip())
-        work = self._unique(max(0, target - completed), seen)
+        remaining = max(0, target - completed)
+        work = self._unique(remaining, seen)
 
         def batches() -> Iterator[list[BattleSample]]:
             while batch := [sample for sample, _ in islice(work, batch_size)]:
                 yield batch
+
+        def publish_manifest() -> None:
+            nonlocal synced_shards
+            self._write_manifest(path, entries, completed + written)
+            if sync_root is not None:
+                while synced_shards < len(entries):
+                    shard = path.with_name(entries[synced_shards]["filename"])
+                    _sync_file_atomic(shard, sync_root)
+                    synced_shards += 1
+                _sync_file_atomic(manifest, sync_root)
+                if failed_path is not None and failed_path.is_file():
+                    _sync_file_atomic(failed_path, sync_root)
 
         def flush(count: int) -> None:
             nonlocal index, written
@@ -519,10 +550,16 @@ class HighScoreSampler:
             del pending[:count]
             written += count
             index += 1
+            publish_manifest()
+            if progress_stderr:
+                print(f"Collected {completed + written}/{target} battles ({written} new), wrote {shard.name}",
+                      file=sys.stderr, flush=True)
 
         def simulate(batch: list[BattleSample]) -> tuple[list[BattleSample], list[dict[str, str]]]:
             try:
                 return self.simulate_samples(client, batch), []
+            except SimulationTimeoutError:
+                raise
             except SimulationError as exc:
                 if not isolate:
                     raise
@@ -536,11 +573,22 @@ class HighScoreSampler:
         try:
             with ThreadPoolExecutor(max_workers=concurrency) as pool:
                 stream = batches()
-                while window := list(islice(stream, concurrency)):
+                while remaining:
+                    if max_seconds is not None and time.monotonic() - started >= max_seconds:
+                        stopped_by_time_limit = True
+                        break
+                    window = list(islice(stream, concurrency))
+                    remaining -= sum(map(len, window))
                     futures = [pool.submit(simulate, batch) for batch in window]
                     for future in futures:
                         valid, errors = future.result()
                         pending.extend(valid)
+                        for sample in valid:
+                            runs = len(sample.runs)
+                            new_subruns += runs
+                            repeated_battles += runs > self.initial_runs
+                            buckets_new[sample.bucket] += 1
+                            guilds_new[sample.guild_id] += 1
                         failed += len(errors)
                         if errors and failed_path is not None:
                             failed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -552,13 +600,25 @@ class HighScoreSampler:
         except (SimulationError, KeyboardInterrupt):
             if pending:
                 flush(len(pending))
-            self._write_manifest(path, entries, completed + written)
+            else:
+                publish_manifest()
             raise
         if pending:
             flush(len(pending))
-        self._write_manifest(path, entries, completed + written)
-        result = {"existing_battles": completed, "new_battles": written, "total_battles": completed + written,
-                  "new_shards": index - max(shards, default=-1) - 1}
+        else:
+            publish_manifest()
+        elapsed = max(1e-9, time.monotonic() - started)
+        result = {
+            "existing_battles": completed, "new_battles": written, "total_battles": completed + written,
+            "new_shards": index - max(shards, default=-1) - 1,
+            "existing_subruns": existing_subruns, "new_subruns": new_subruns,
+            "total_subruns": existing_subruns + new_subruns,
+            "repeated_battles": repeated_battles, "repeat_rate": repeated_battles / written if written else 0.0,
+            "elapsed_sec": round(elapsed, 4), "rows_per_sec": round(written / elapsed, 4),
+            "subruns_per_sec": round(new_subruns / elapsed, 4), "stopped_by_time_limit": stopped_by_time_limit,
+            "buckets_new": dict(sorted(buckets_new.items())),
+            "guilds_new": {str(k): v for k, v in sorted(guilds_new.items())},
+        }
         if isolate:
             result["failed_battles"] = failed
         return result
@@ -581,10 +641,30 @@ class HighScoreSampler:
             temporary.unlink(missing_ok=True)
 
 
-def _shard_entry(path: Path, rows: int) -> dict[str, Any]:
+def _file_sha256(path: Path) -> str:
     with path.open("rb") as f:
-        digest = hashlib.file_digest(f, "sha256").hexdigest()
-    return {"filename": path.name, "row_count": rows, "sha256": digest}
+        return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def _shard_entry(path: Path, rows: int) -> dict[str, Any]:
+    return {"filename": path.name, "row_count": rows, "sha256": _file_sha256(path)}
+
+
+def _sync_file_atomic(src: Path, dst_dir: Path) -> bool:
+    if not src.is_file() or src.parent.resolve() == dst_dir.resolve():
+        return False
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / src.name
+    if dst.is_file() and _file_sha256(src) == _file_sha256(dst):
+        return False
+    with tempfile.NamedTemporaryFile(dir=dst_dir, prefix=f".{src.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        shutil.copy2(src, temporary)
+        os.replace(temporary, dst)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
 
 
 def _shard_path(base: Path, index: int) -> Path:
@@ -668,6 +748,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, help="sampling seed for this worker")
     parser.add_argument("--round-id", help="round identifier for this worker")
     parser.add_argument("--chunk-size", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--timeout-sec", type=float)
+    parser.add_argument("--max-seconds", type=float)
+    parser.add_argument("--sync-dir", type=Path)
+    parser.add_argument("--progress", action="store_true")
     parser.add_argument("--isolate-errors", action="store_true", help="quarantine samples that fail simulation")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", type=int, metavar="N")
@@ -675,12 +761,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run is None and args.out is None:
         parser.error("--out is required when collecting battles")
     try:
+        for name in ("batch_size", "concurrency", "timeout_sec", "max_seconds"):
+            if (value := getattr(args, name)) is not None and not value > 0:
+                raise ValueError(f"{name} must be positive")
         catalog = FeatureCatalog.load(args.catalog)
         profile = json.loads(args.profile.read_text(encoding="utf-8"))
         config = json.loads(args.sampling.read_text(encoding="utf-8"))
-        for name in ("seed", "round_id", "chunk_size"):
+        for name in ("seed", "round_id", "chunk_size", "batch_size", "concurrency"):
             if (value := getattr(args, name)) is not None:
                 config[name] = value
+        if args.timeout_sec is not None:
+            profile["timeout_sec"] = args.timeout_sec
         if args.isolate_errors:
             config["isolate_batch_errors"] = True
         sampler = HighScoreSampler(catalog, profile, config)
@@ -693,6 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             result = sampler.collect(
                 SimClient(args.url, catalog, profile), args.out, target, resume=args.resume,
                 failure_log=args.out.with_name(f"{args.out.stem}.failed.jsonl"),
+                sync_dir=args.sync_dir, max_seconds=args.max_seconds, progress_stderr=args.progress,
             )
     except (ImportError, OSError, ValueError, SimulationError) as exc:
         parser.exit(1, f"sampling failed: {exc}\n")

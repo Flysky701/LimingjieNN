@@ -8,6 +8,7 @@ set -euo pipefail
 #     --cache-dir /content/drive/MyDrive/LimingjieNN/cache \
 #     --db-path /content/drive/MyDrive/LimingjieNN/master_cn.db \
 #     --db-version 202611131613 \
+#     --persistent-tar /content/drive/MyDrive/LimingjieNN/cache/persistent_offline_202611131613.tar \
 #     --port 8080
 
 CACHE_DIR="${PCRCALC_CACHE_DIR:-/content/pcr_cache}"
@@ -21,8 +22,19 @@ PORT="${PCRCALC_PORT:-8080}"
 HOST="${PCRCALC_HOST:-127.0.0.1}"
 RELEASE_URL="${PCRCALC_RELEASE_URL:-https://github.com/cc004/PCRCalculator/releases/download/v2.11.0/PCRCalculator-2.11.0-server-linux.zip}"
 DISCOVER_LATEST="false"
+PERSISTENT_TAR="${PCRCALC_PERSISTENT_TAR:-}"
+PERSISTENT_TAR_SHA256="${PCRCALC_PERSISTENT_TAR_SHA256:-}"
+STOP_ONLY=false
 
 while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cache-dir|--work-dir|--db-path|--db-sha256|--db-version|--port|--host|--release-url|--persistent-tar|--persistent-tar-sha256)
+      if [[ -z "${2:-}" || "$2" == --* ]]; then
+        echo "[error] $1 requires a value" >&2
+        exit 2
+      fi
+      ;;
+  esac
   case "$1" in
     --cache-dir) CACHE_DIR="$2"; shift 2 ;;
     --work-dir) WORK_DIR="$2"; shift 2 ;;
@@ -32,6 +44,9 @@ while [[ $# -gt 0 ]]; do
     --port) PORT="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --release-url) RELEASE_URL="$2"; shift 2 ;;
+    --persistent-tar) PERSISTENT_TAR="$2"; shift 2 ;;
+    --persistent-tar-sha256) PERSISTENT_TAR_SHA256="$2"; shift 2 ;;
+    --stop-only) STOP_ONLY=true; shift ;;
     --discover-latest) DISCOVER_LATEST="true"; shift ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
@@ -41,7 +56,30 @@ WORK_DIR="${WORK_DIR:-/tmp/pcr_calc_server_${PORT}}"
 PID_FILE="/tmp/pcr_calc_server_${PORT}.pid"
 LOG_FILE="/tmp/pcr_calc_server_${PORT}.log"
 export PCRCALC_PERSISTENT_DATA_PATH="/tmp/pcr_calc_persistent_${PORT}"
-mkdir -p "$CACHE_DIR" "$WORK_DIR" "$PCRCALC_PERSISTENT_DATA_PATH"
+stop_server() {
+  local old_pid="" attempt
+  if [[ -f "$PID_FILE" ]]; then
+    old_pid="$(cat "$PID_FILE")" || old_pid=""
+    if [[ "$old_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill -TERM "$old_pid" 2>/dev/null || true
+      for ((attempt = 0; attempt < 10; attempt++)); do
+        kill -0 "$old_pid" 2>/dev/null || break
+        sleep 0.5
+      done
+      if kill -0 "$old_pid" 2>/dev/null; then
+        kill -KILL "$old_pid" 2>/dev/null || true
+      fi
+    fi
+  fi
+  rm -f "$PID_FILE"
+}
+
+if [[ "$STOP_ONLY" == true ]]; then
+  stop_server
+  exit 0
+fi
+
+mkdir -p "$CACHE_DIR" "$WORK_DIR"
 
 # 1) Install minimal Ubuntu shared libs if missing (best-effort on Colab)
 if command -v apt-get >/dev/null 2>&1; then
@@ -78,18 +116,62 @@ if [[ ! -x "$WORK_DIR/PCRCalculatorServer" ]]; then
   chmod +x "$WORK_DIR/PCRCalculatorServer"
 fi
 
-# 4) Verify & stage offline locked CN DB as prod<BossVersionCN>.db (per AssetManagerCN.DataVer)
+# 4) Stage the offline cache and locked CN DB on local storage.
+stop_server
+if [[ -L "$PCRCALC_PERSISTENT_DATA_PATH" ]]; then
+  rm -f "$PCRCALC_PERSISTENT_DATA_PATH"
+fi
+mkdir -p "$PCRCALC_PERSISTENT_DATA_PATH"
+
+if [[ -z "$PERSISTENT_TAR" && -f "$CACHE_DIR/persistent_offline_${DB_VERSION}.tar" ]]; then
+  PERSISTENT_TAR="$CACHE_DIR/persistent_offline_${DB_VERSION}.tar"
+fi
+if [[ -n "$PERSISTENT_TAR" ]]; then
+  if [[ ! -f "$PERSISTENT_TAR" ]]; then
+    echo "[error] Persistent archive does not exist: $PERSISTENT_TAR" >&2
+    exit 1
+  fi
+  if [[ -z "$PERSISTENT_TAR_SHA256" && -f "${PERSISTENT_TAR}.sha256" ]]; then
+    PERSISTENT_TAR_SHA256="$(awk 'NR == 1 {print $1; exit}' "${PERSISTENT_TAR}.sha256")"
+    if [[ ! "$PERSISTENT_TAR_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+      echo "[error] Invalid SHA256 in ${PERSISTENT_TAR}.sha256" >&2
+      exit 1
+    fi
+  fi
+  TAR_SHA="$(sha256sum < "$PERSISTENT_TAR" | awk '{print $1}')"
+  if [[ -n "$PERSISTENT_TAR_SHA256" && "${TAR_SHA,,}" != "${PERSISTENT_TAR_SHA256,,}" ]]; then
+    echo "[error] Persistent archive SHA256 mismatch: expected=$PERSISTENT_TAR_SHA256 actual=$TAR_SHA" >&2
+    exit 1
+  fi
+fi
+
+find "$PCRCALC_PERSISTENT_DATA_PATH" -type l -delete
+
 DB_NAME="prod${DB_VERSION}.db"
 if [[ -z "$DB_PATH" && ! -f "$PCRCALC_PERSISTENT_DATA_PATH/$DB_NAME" && -f "$CACHE_DIR/persistent/$DB_NAME" ]]; then
   DB_PATH="$CACHE_DIR/persistent/$DB_NAME"
 fi
+
+if [[ -n "$PERSISTENT_TAR" ]]; then
+  UNPACKED_SHA_FILE="$PCRCALC_PERSISTENT_DATA_PATH/.unpacked_tar_sha256"
+  if [[ ! -f "$UNPACKED_SHA_FILE" || "$(cat "$UNPACKED_SHA_FILE")" != "$TAR_SHA" ]]; then
+    echo "[setup] Staging $PERSISTENT_TAR -> $PCRCALC_PERSISTENT_DATA_PATH"
+    rm -f "$UNPACKED_SHA_FILE"
+    tar -xf "$PERSISTENT_TAR" -C "$PCRCALC_PERSISTENT_DATA_PATH"
+    find "$PCRCALC_PERSISTENT_DATA_PATH" -type l -delete
+    printf '%s\n' "$TAR_SHA" > "$UNPACKED_SHA_FILE"
+  else
+    echo "[setup] Reusing locally unpacked cache: $PCRCALC_PERSISTENT_DATA_PATH"
+  fi
+fi
+
 if [[ -n "$DB_PATH" ]]; then
   if [[ ! -f "$DB_PATH" ]]; then
     echo "[error] Specified --db-path does not exist: $DB_PATH" >&2
     exit 1
   fi
   if [[ -n "$DB_SHA256" ]]; then
-    ACTUAL_SHA="$(sha256sum "$DB_PATH" | awk '{print $1}')"
+    ACTUAL_SHA="$(sha256sum < "$DB_PATH" | awk '{print $1}')"
     if [[ "${ACTUAL_SHA,,}" != "${DB_SHA256,,}" ]]; then
       echo "[error] DB SHA256 mismatch: expected=$DB_SHA256 actual=$ACTUAL_SHA" >&2
       exit 1
@@ -98,22 +180,17 @@ if [[ -n "$DB_PATH" ]]; then
   fi
 fi
 
-# Stop any prior server on this port before staging its database.
-if [[ -f "$PID_FILE" ]]; then
-  OLD_PID="$(cat "$PID_FILE")"
-  if [[ "$OLD_PID" =~ ^[1-9][0-9]*$ ]] && kill -0 "$OLD_PID" 2>/dev/null; then
-    kill "$OLD_PID" || true
-    sleep 1
-  fi
-fi
-
 LOCAL_DB="$PCRCALC_PERSISTENT_DATA_PATH/$DB_NAME"
+WORK_DB="$WORK_DIR/$DB_NAME"
+if [[ -L "$WORK_DB" ]]; then
+  rm -f "$WORK_DB"
+fi
 if [[ -n "$DB_PATH" && ! "$DB_PATH" -ef "$LOCAL_DB" ]]; then
-  cp -f "$DB_PATH" "$LOCAL_DB"
+  cp -f --remove-destination "$DB_PATH" "$LOCAL_DB"
   echo "[setup] Staged offline CN DB as $DB_NAME"
 fi
-if [[ -f "$LOCAL_DB" && ! "$LOCAL_DB" -ef "$WORK_DIR/$DB_NAME" ]]; then
-  cp -f "$LOCAL_DB" "$WORK_DIR/$DB_NAME"
+if [[ -f "$LOCAL_DB" && ! "$LOCAL_DB" -ef "$WORK_DB" ]]; then
+  cp -f --remove-destination "$LOCAL_DB" "$WORK_DB"
 fi
 
 # 5) Configure CN runtime environment (pinned offline version unless --discover-latest)

@@ -314,6 +314,13 @@ class TorchTests(unittest.TestCase):
         return collate_battle_batch([featurize_sample(self.catalog, s, **self.maps, roster_max_len=16,
                                                      relic_max_len=8) for s in samples])
 
+    def experiment_fixture(self, *modes, epochs=1):
+        configs = [replace(self.config(mode), epochs=epochs, batch_size=16, val_ratio=.25, test_ratio=.25,
+                           n_context_layers=1, n_team_layers=1) for mode in modes]
+        samples = [battle(sample_id=f"s-{i}", canonical_wave_sig=f"wave-{i}", outcome_counts=[i % 3, 1, 1],
+                          alpha_rupee=None if i % 2 else 1000) for i in range(16)]
+        return configs, samples
+
     def test_eval_cache_and_epoch_seeded_training_features(self):
         evaluation = BattleDataset(self.catalog, [battle()], cache_eval=True, gold_mask_prob=1)
         with patch("labyrinth_nn.data.dataset.featurize_sample", wraps=featurize_sample) as featurize:
@@ -587,6 +594,146 @@ class TorchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "sample split"):
                 train_critic(c, self.catalog, samples[:-1], root / "changed", device="cpu",
                              resume=report["runs"][1]["checkpoint"])
+
+    def test_auto_resume_skips_completed_resumes_partial_and_preserves_summary(self):
+        configs, samples = self.experiment_fixture("m0", "m1", epochs=2)
+        first, second = configs
+        seeds = (42, 43)
+        options = dict(split_seed=42, device="cpu")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clean, target = root / "clean", root / "target"
+            run_experiments(configs, self.catalog, samples, clean, seeds=seeds, **options)
+
+            completed_dir = target / first.ablation_mode / "seed_42"
+            train_critic(first, self.catalog, samples, completed_dir, seed=42, **options)
+            best_path = completed_dir / "best.pt"
+            state = torch.load(best_path, map_location="cpu", weights_only=True)
+            state.pop("group_by")
+            state.pop("calibration")
+            torch.save(state, best_path)
+            metrics_path = completed_dir / "test_metrics.json"
+            report = json.loads(metrics_path.read_text(encoding="utf-8"))
+            for field in ("calibration", "counterfactual_gold_unknown"):
+                report.pop(field)
+            metrics_path.write_text(json.dumps(report), encoding="utf-8")
+
+            interrupted_dir = target / first.ablation_mode / "seed_43"
+            save_checkpoint = training._save_checkpoint
+
+            def interrupt_after_epoch_one(path, payload):
+                save_checkpoint(path, payload)
+                if path.name == "last.pt" and payload["epoch"] == 1:
+                    raise KeyboardInterrupt
+
+            with patch.object(training, "_save_checkpoint", side_effect=interrupt_after_epoch_one):
+                with self.assertRaises(KeyboardInterrupt):
+                    train_critic(first, self.catalog, samples, interrupted_dir, seed=43, **options)
+            last_path = interrupted_dir / "last.pt"
+            self.assertTrue(last_path.is_file())
+            self.assertFalse((interrupted_dir / "best.pt").exists())
+
+            with patch("labyrinth_nn.train.train_critic.train_critic", wraps=training.train_critic) as fit:
+                run_experiments(configs, self.catalog, samples, target, seeds=seeds, auto_resume=True, **options)
+            calls = {(call.args[0].ablation_mode, call.kwargs["seed"]): call.kwargs["resume"]
+                     for call in fit.call_args_list}
+            self.assertEqual(fit.call_count, 3)
+            self.assertEqual(calls, {(first.ablation_mode, 43): last_path, (second.ablation_mode, 42): None,
+                                     (second.ablation_mode, 43): None})
+
+            def read_summary(directory):
+                summary = json.loads((directory / "ablation_summary.json").read_text(encoding="utf-8"))
+                for mode in summary["modes"].values():
+                    for run in mode["runs"]:
+                        run["checkpoint"] = Path(run["checkpoint"]).relative_to(directory).as_posix()
+                return summary
+
+            self.assertEqual(read_summary(clean), read_summary(target))
+            self.assertEqual((clean / "ablation_summary.md").read_bytes(), (target / "ablation_summary.md").read_bytes())
+
+            longer = [replace(config, epochs=3) for config in configs]
+            with patch("labyrinth_nn.train.train_critic.train_critic", wraps=training.train_critic) as fit:
+                summary = run_experiments(longer, self.catalog, samples, target, seeds=seeds, auto_resume=True, **options)
+            self.assertEqual(fit.call_count, 4)
+            self.assertEqual({(call.args[0].ablation_mode, call.kwargs["seed"]): call.kwargs["resume"]
+                              for call in fit.call_args_list},
+                             {(config.ablation_mode, seed): target / config.ablation_mode / f"seed_{seed}" / "last.pt"
+                              for config in longer for seed in seeds})
+            for mode in summary["modes"].values():
+                for run in mode["runs"]:
+                    self.assertEqual([row["epoch"] for row in run["history"]], [1, 2, 3])
+
+            early_stop_dir = root / "early_stop"
+            with patch.object(training, "_selection_nll", return_value=1.0):
+                stopped = run_experiments([replace(first, epochs=3)], self.catalog, samples, early_stop_dir,
+                                          seeds=[42], patience=1, **options)
+            run = stopped["modes"][first.ablation_mode]["runs"][0]
+            self.assertEqual([row["epoch"] for row in run["history"]], [1, 2])
+            with patch("labyrinth_nn.train.train_critic.train_critic", wraps=training.train_critic) as fit:
+                reused = run_experiments([replace(first, epochs=4)], self.catalog, samples, early_stop_dir,
+                                         seeds=[42], patience=1, auto_resume=True, **options)
+            fit.assert_not_called()
+            self.assertEqual(reused, stopped)
+
+    def test_single_resume_does_not_clobber_multi_mode_ablation_summary(self):
+        configs, samples = self.experiment_fixture("m0", "m1")
+        config = configs[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, run_configs, seeds in (("multi_mode", configs, (42,)), ("multi_seed", [config], (42, 43))):
+                with self.subTest(name=name):
+                    root = Path(tmp) / name
+                    run_experiments(run_configs, self.catalog, samples, root, seeds=seeds, device="cpu")
+                    json_path = root / "ablation_summary.json"
+                    markdown_path = root / "ablation_summary.md"
+                    json_before, markdown_before = json_path.read_bytes(), markdown_path.read_bytes()
+                    run_dir = root / config.ablation_mode / "seed_42"
+                    resume = run_dir / "last.pt"
+                    longer = replace(config, epochs=2)
+                    summary = run_experiments([longer], self.catalog, samples, root, device="cpu", resume=resume)
+                    self.assertEqual(json_path.read_bytes(), json_before)
+                    self.assertEqual(markdown_path.read_bytes(), markdown_before)
+                    self.assertEqual(json.loads((run_dir / "resume_summary.json").read_text(encoding="utf-8")), summary)
+                    run = summary["modes"][config.ablation_mode]["runs"][0]
+                    self.assertEqual([row["epoch"] for row in run["history"]], [1, 2])
+                    with self.assertRaisesRegex(ValueError, "use either --resume or --auto-resume, not both"):
+                        run_experiments([longer], self.catalog, samples, root, resume=resume, auto_resume=True)
+
+    def test_cli_epochs_override_and_auto_resume(self):
+        configs, samples = self.experiment_fixture("m0", epochs=3)
+        config = configs[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
+            catalog_path = self.catalog.save(root / "catalog.json")
+            samples_path = write_samples_jsonl(root / "samples.jsonl", samples)
+            out_dir = root / "fit"
+            args = ["--config", str(config_path), "--catalog", str(catalog_path), "--samples", str(samples_path),
+                    "--out-dir", str(out_dir), "--device", "cpu"]
+            summary_path = out_dir / "ablation_summary.json"
+            run_dir = out_dir / config.ablation_mode / "seed_42"
+            auto_args = [*args, "--epochs", "1", "--auto-resume"]
+            with patch("labyrinth_nn.train.train_critic.train_critic", wraps=training.train_critic) as fit:
+                training.main(auto_args)
+                fit.assert_called_once()
+                self.assertEqual(fit.call_args.args[0].epochs, 1)
+                self.assertIsNone(fit.call_args.kwargs["resume"])
+                fit.reset_mock()
+
+                expected = json.loads(summary_path.read_text(encoding="utf-8"))
+                run = expected["modes"][config.ablation_mode]["runs"][0]
+                self.assertEqual([row["epoch"] for row in run["history"]], [1])
+                metrics_path = run_dir / "test_metrics.json"
+                metrics_path.write_text(json.dumps({**run, "seed": 999, "metrics": {}}), encoding="utf-8")
+                training.main(auto_args)
+                fit.assert_not_called()
+                self.assertEqual(json.loads(summary_path.read_text(encoding="utf-8")), expected)
+
+                with self.assertRaisesRegex(ValueError, "--epochs must be at least 1"):
+                    training.main([*args, "--epochs", "0"])
+                with self.assertRaisesRegex(ValueError, "use either --resume or --auto-resume, not both"):
+                    training.main([*auto_args, "--resume", str(run_dir / "last.pt")])
+                fit.assert_not_called()
 
     @unittest.skipUnless(HAS_TORCH and HAS_ONNX_AND_ORT, "requires PyTorch, NumPy, ONNX and ONNX Runtime")
     def test_export_manifest_replay_inputs_and_runtime_parity(self):

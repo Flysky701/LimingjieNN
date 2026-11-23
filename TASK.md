@@ -2,7 +2,7 @@
 
 本任务书面向在 **Google Colab / 云端 GPU 环境**执行 `LimingjieNN` 训练流水线，并供**自动监督 Agent** 巡检云端产物、判断阶段门禁、执行断点续跑与异常处理。
 
-> 执行入口与对应参数以仓库内 [notebooks/colab_labyrinth_pipeline.ipynb](notebooks/colab_labyrinth_pipeline.ipynb)、[scripts/colab_setup_simulator.sh](scripts/colab_setup_simulator.sh) 及 `configs/*.json` 为准。
+> 执行入口与对应参数以仓库内 [notebooks/colab_labyrinth_pipeline.ipynb](notebooks/colab_labyrinth_pipeline.ipynb)、[scripts/colab_setup_simulator.sh](scripts/colab_setup_simulator.sh) 及 `configs/*.json` 为准。预算、故障恢复与汇报约束见 [自动监督规则](docs/AGENT_SUPERVISION_RULES.md)。
 
 ---
 
@@ -11,13 +11,16 @@
 | 项 | 约定路径 / 地址 | 说明 |
 | :--- | :--- | :--- |
 | **GitHub 私有仓库** | `https://github.com/Flysky701/LimingjieNN`（`main` 分支） | 仅存放代码、配置、脚本、Notebook 与任务书 |
-| **Colab 本地工作副本** | `/content/LimingjieNN` 或 `/content/LimingjieNN-drive` | 分别用于私有 GitHub 克隆和 Drive `repo/` 同步 |
+| **Colab 本地工作副本** | `/content/LimingjieNN-zip`、`/content/LimingjieNN-drive` 或 `/content/LimingjieNN` | 对应 Drive 的 `source.zip`、Drive 的 `repo/` 和私有 GitHub 克隆 |
 | **Google Drive 根目录** | `/content/drive/MyDrive/LimingjieNN/` | 持久化存储 DB、样本、Checkpoint 与导出包 |
 | ├ `master_cn.db` | `$DRIVE_ROOT/master_cn.db` | 离线锁定国服主库（`BossVersionCN=202611131613`，见 `configs/sim_profile_highscore_cn.json`）；**严禁入库 Git** |
 | ├ `cache/` | `$DRIVE_ROOT/cache/` | 缓存 `PCRCalculator-2.11.0-server-linux.zip`。各端口使用本地 `/tmp/pcr_calc_persistent_<port>` |
+| ├ `cache/wheelhouse/` | `$CACHE_DIR/wheelhouse/` | 跨运行时复用的 Python ABI 兼容 wheels |
+| ├ `cache/persistent_offline_202611131613.tar` | `$CACHE_DIR/persistent_offline_202611131613.tar` | 模拟器持久缓存的未压缩归档，随同名 `.sha256` 校验后解包至本地 SSD |
 | ├ `data/` | `$DRIVE_ROOT/data/` | `feature_pack.json`、`round0_pilot.jsonl` 及 `round0_pilot.part-*.jsonl` |
 | ├ `runs/` | `$DRIVE_ROOT/runs/ablation_round0/` | `<mode>/seed_<seed>/{last.pt,best.pt,test_metrics.json}`、`ablation_summary.{json,md}` |
 | ├ `export_bundle/` | `$DRIVE_ROOT/export_bundle/<winning_mode>/` | `tower_a.onnx`、`tower_b.onnx`、`manifest.json`、`golden_io.json` |
+| ├ `status/latest_receipt.json` | `$STATUS_DIR/latest_receipt.json` | 唯一机器可读回执，`status/` 同时保存 S0 门禁报告 |
 | └ `replays.jsonl` | `$DRIVE_ROOT/replays.jsonl` | （可选）真实开局地图录制文件，用于 Path B 回放对照 |
 
 建议在 Colab Shell / Notebook 中统一导出环境变量：
@@ -28,6 +31,7 @@ export CACHE_DIR="$DRIVE_ROOT/cache"
 export DATA_DIR="$DRIVE_ROOT/data"
 export RUNS_DIR="$DRIVE_ROOT/runs"
 export EXPORT_DIR="$DRIVE_ROOT/export_bundle"
+export STATUS_DIR="$DRIVE_ROOT/status"
 export CN_DB_PATH="$DRIVE_ROOT/master_cn.db"
 export CN_DB_VERSION="202611131613"
 ```
@@ -54,138 +58,103 @@ export CN_DB_VERSION="202611131613"
 
 ### Phase 0 · 环境与单测门禁
 
+在当前运行时进入锁定提交的本地工作副本。Notebook Cell 1 自动选择代码来源并导出第 1 节的环境变量。
+
 ```bash
-cd /content/LimingjieNN
-pip install -q -e ".[train]"
-PYTHONPATH=src python -m unittest discover -s tests -v
+export PYTHONPATH="$PWD/src"
+export CN_DB_PATH="$DRIVE_ROOT/master_cn.db"
+mkdir -p "$STATUS_DIR"
+bash scripts/colab_install_deps.sh --repo-dir "$PWD" --wheelhouse "$CACHE_DIR/wheelhouse"
+python -m unittest discover -s tests -v
+
+mapfile -t pilot_shards < <(
+  find "$DATA_DIR" -maxdepth 1 -type f -name 'round0_pilot*.jsonl' |
+  grep -E '/round0_pilot(\.part-[0-9]{5,})?\.jsonl$' | sort
+)
+python -m labyrinth_nn.data.s0_preburn verify-data \
+  --db "$CN_DB_PATH" --catalog "$DATA_DIR/feature_pack.json" \
+  --samples "${pilot_shards[@]}" --expected-shards 68 --expected-unique 25000 \
+  --min-nonwin-audit 200 --out "$STATUS_DIR/s0_verify_data.json"
 ```
 
-**验收门禁**：
-- `tests/` 下全部单元测试通过（不可跳过 `test_export_manifest_replay_inputs_and_runtime_parity`，确保已正确安装 `torch`、`numpy`、`onnx`、`onnxruntime`）。
+**验收门禁**：单元测试全部通过且跳过数为 0，包含真实国服库和 ONNX Runtime 对齐测试。审计核对锁库、特征目录、68 个 Pilot 分片、25,000 个唯一 ID 及至少 200 个非胜样例的伤害标签算术。若已有锁定摘要，给 `verify-data` 追加 `--db-sha256` 和 `--catalog-sha256`。打印完整报告供巡检。
 
 ---
 
 ### Phase 1 · 特征目录与模拟器口径对账
 
-1. 拉起无头 `PCRCalculatorServer`（离线锁定 `BossVersionCN=202611131613`）：
+1. 将持久缓存归档打包至 Drive，再一次性解包到本地 SSD。已经有归档时复用原件，锁定的 `master_cn.db` 始终覆盖归档中的同名 DB。
 
 ```bash
-chmod +x scripts/colab_setup_simulator.sh
+persistent_tar="$CACHE_DIR/persistent_offline_${CN_DB_VERSION}.tar"
+if [[ ! -f "$persistent_tar" ]]; then
+  bash scripts/pack_persistent_cache.sh --persistent-dir "$CACHE_DIR/persistent" --out "$persistent_tar"
+fi
 bash scripts/colab_setup_simulator.sh \
-  --cache-dir "$CACHE_DIR" \
-  --db-path "$CN_DB_PATH" \
-  --db-version "$CN_DB_VERSION" \
-  --port 8080
+  --cache-dir "$CACHE_DIR" --persistent-tar "$persistent_tar" \
+  --db-path "$CN_DB_PATH" --db-version "$CN_DB_VERSION" --port 8080
 ```
 
-2. 提取国服客观特征目录：
+2. 首次缺少特征目录时，从国服锁库提取。进入 S1 前核对目录并冻结该文件。
 
 ```bash
-PYTHONPATH=src python -m labyrinth_nn.catalog.build_catalog \
-  --db "$CN_DB_PATH" \
-  --out "$DATA_DIR/feature_pack.json"
+if [[ ! -f "$DATA_DIR/feature_pack.json" ]]; then
+  python -m labyrinth_nn.catalog.build_catalog --db "$CN_DB_PATH" --out "$DATA_DIR/feature_pack.json"
+fi
 ```
 
-3. 运行 15 项国服口径对账与吞吐压测：
+3. 执行 16 项国服口径对账与 64 子局吞吐探针。以下为 Round 0 复现示例，S0 / Round 1 改用 `configs/sim_profile_round1_cn.json` 和 `probe_round1.json`。
 
 ```bash
-PYTHONPATH=src python -m labyrinth_nn.data.probe_simulator \
+python -m labyrinth_nn.data.probe_simulator \
   --catalog "$DATA_DIR/feature_pack.json" \
   --profile configs/sim_profile_highscore_cn.json \
-  --url http://127.0.0.1:8080 \
-  --bench-count 64
+  --url http://127.0.0.1:8080 --bench-count 64 > "$DATA_DIR/probe_round0.json"
 ```
 
-**验收门禁**：
-- `feature_pack.json` 成功生成且包含 `db_version`、`catalog_sha256`、`units`、`enemies`、`quests`、`relics`。
-- `probe_simulator` 退出码为 `0`，输出 JSON 中 `"passed": true`，并记录压测吞吐 `benchmark.sims_per_sec`。
+**验收门禁**：目录包含 `db_version`、`catalog_sha256`、`units`、`enemies`、`quests`、`relics`。探针退出码为 0，JSON 的 `passed` 为 `true`，16 项全部通过并记录 `benchmark.sims_per_sec`。
 
 ---
 
 ### Phase 2 · Round 0 分层自适应采样复现（2k 烟测 → 25k Pilot）
 
-1. 先执行分布干跑检查（不请求模拟器）：
+先用完整配置做 2,000 条分布干跑。真实烟测先设 `--target-battles 2000`，验收后调到 25,000。先按 Notebook Cell 5 把全部已有分片、manifest 和失败日志恢复至本地，再运行采样命令。Round 1 用第 5 节的 S1 命令。
 
 ```bash
-PYTHONPATH=src python -m labyrinth_nn.data.sampler \
+python -m labyrinth_nn.data.sampler \
   --catalog "$DATA_DIR/feature_pack.json" \
+  --profile configs/sim_profile_highscore_cn.json --sampling configs/sampling_round0.json \
   --dry-run 2000
-```
 
-2. 在高速本地 `/tmp` 执行分片断点续采（`2000` 烟测 → `25000` Pilot）。Round 1 走第 5 节 S1。
-
-```bash
-mkdir -p "$DATA_DIR"
-# 续采前：同步 Drive 上已有的主文件及所有 .part-*.jsonl 分片到本地 /tmp
-cp -f "$DATA_DIR"/round0_pilot*.jsonl /tmp/ 2>/dev/null || true
-
-PYTHONPATH=src python -m labyrinth_nn.data.sampler \
+python -m labyrinth_nn.data.sampler \
   --catalog "$DATA_DIR/feature_pack.json" \
-  --profile configs/sim_profile_highscore_cn.json \
-  --sampling configs/sampling_round0.json \
-  --url http://127.0.0.1:8080 \
-  --out /tmp/round0_pilot.jsonl \
-  --target-battles 25000 \
-  --resume
-
-# 采样结束或中断后：把全部新增/更新分片原子回写到 Drive
-cp -f /tmp/round0_pilot*.jsonl "$DATA_DIR/"
+  --profile configs/sim_profile_highscore_cn.json --sampling configs/sampling_round0.json \
+  --url http://127.0.0.1:8080 --out /tmp/limingjienn-samples/round0_pilot.jsonl \
+  --target-battles 25000 --batch-size 16 --concurrency 1 --timeout-sec 120 \
+  --sync-dir "$DATA_DIR" --max-seconds 10800 --progress --isolate-errors --resume
 ```
 
-> **关键分片避坑说明**：
-> `sampler.py` 每累计 `chunk_size=5000`（见 `configs/sampling_round0.json`）或在捕获 `SimulationError` / `KeyboardInterrupt` 时，会把样本分片写入 `round0_pilot.jsonl` 及 `round0_pilot.part-00001.jsonl`、`round0_pilot.part-00002.jsonl` ……（见 `_shard_path`）。
-> **切勿只同步 `round0_pilot.jsonl` 单文件**！无论恢复续采还是后续训练，都必须带上全部 `round0_pilot*.jsonl` 分片，否则会丢失已采样本并导致重复采样或缺失数据。
-
-**验收门禁**：
-- `sampler.py` 退出码为 `0`，返回 JSON 中 `total_battles` 达到目标体量（烟测 `2000`、Pilot `25000`）。
-- Drive `$DATA_DIR/` 中主文件与所有 `.part-NNNNN.jsonl` 分片时间戳最新且非空。
+**验收门禁**：核对每段落盘的主文件与全部 `.part-NNNNN.jsonl`、manifest 哈希和失败日志。计划内分段可能在达到目标前正常退出，仍需在下一段接力。只有 `total_battles` 达到所选目标时采样阶段才完成。
 
 ---
 
 ### Phase 3 · 四档消融训练与独立温度校准（`m0 -> m1 -> m2a -> m2b`）
 
-1. 运行四档消融阶梯（`train_critic.py --samples` 支持 `nargs="+"`，直接传入全部分片）：
+用 Notebook Cell 6 校验完整训练分片和各 manifest SHA256 后运行。续训重复原命令，保持同一训练输入、配置、种子列表、`--split-seed` 和输出目录。胜出配置的多种子复验需要保留原有消融汇总时，使用独立输出目录。
 
 ```bash
-PYTHONPATH=src python -m labyrinth_nn.train.train_critic \
-  --configs m0 m1 m2a m2b \
-  --seeds 42 \
-  --amp \
-  --catalog "$DATA_DIR/feature_pack.json" \
-  --samples "$DATA_DIR"/round0_pilot.jsonl "$DATA_DIR"/round0_pilot.part-*.jsonl \
-  --out-dir "$RUNS_DIR/ablation_round0"
-```
-
-2. 对胜出配置执行多种子复验（示例 3 种子集成）：
-
-```bash
-PYTHONPATH=src python -m labyrinth_nn.train.train_critic \
-  --configs m2b \
-  --seeds 42 43 44 \
-  --amp \
-  --catalog "$DATA_DIR/feature_pack.json" \
-  --samples "$DATA_DIR"/round0_pilot.jsonl "$DATA_DIR"/round0_pilot.part-*.jsonl \
-  --out-dir "$RUNS_DIR/ablation_round0"
-```
-
-3. Colab 断线后单次恢复续训（**严格约束**）：
-   `train_critic.py --resume` 仅允许恢复**单个配置 + 单个种子**（`len(configs) * len(seeds) == 1`），且传入的 `--catalog`、`--samples`（全部分片完全一致）及 `--split-seed` 必须与生成 `last.pt` 时一致，否则会因 `split_sha256` 或配置校验报错退出：
-
-```bash
-PYTHONPATH=src python -m labyrinth_nn.train.train_critic \
-  --config configs/critic_<mode>.json \
-  --seeds <seed> \
-  --amp \
-  --resume "$RUNS_DIR/ablation_round0/<mode>/seed_<seed>/last.pt" \
+python -m labyrinth_nn.train.train_critic \
+  --configs m0 m1 m2a m2b --seeds 42 43 --split-seed 42 \
+  --group-by context --auto-resume --amp --device cuda --pin-memory \
   --catalog "$DATA_DIR/feature_pack.json" \
   --samples "$DATA_DIR"/round0_pilot.jsonl "$DATA_DIR"/round0_pilot.part-*.jsonl \
   --out-dir "$RUNS_DIR/ablation_round0"
 ```
 
 **验收门禁**：
-- 每个 `<mode>/seed_<seed>/` 下生成 `last.pt`、`best.pt`、`test_metrics.json`。
-- 根目录生成 `ablation_summary.md` 与 `ablation_summary.json`。
-- 在 `global`、6 个分桶（`normal`、`robot_ex`、`special_dual_ex`、`other_ex`、`boss_3f_d5`、`boss_5f_d5`）和 `gold_unknown` 切片上核验关键指标：`auroc`、`brier_3class`、`brier_win`、`ece_15`、`accuracy_3class`、`loss_damage_mae`、`win_time_mae`、`group_top1_fpr`、`group_top1_pos_fpr`。
+
+- 每个 `<mode>/seed_<seed>/` 生成 `last.pt`、`best.pt`、`test_metrics.json`，根目录生成 `ablation_summary.md` 与 `ablation_summary.json`。
+- 核验 `global`、六个分桶（`normal`、`robot_ex`、`special_dual_ex`、`other_ex`、`boss_3f_d5`、`boss_5f_d5`）和 `gold_unknown` 切片上的 `auroc`、`brier_3class`、`brier_win`、`ece_15`、`accuracy_3class`、`loss_damage_mae`、`win_time_mae`、`group_top1_fpr`、`group_top1_pos_fpr`。
 
 ---
 
@@ -208,7 +177,7 @@ PYTHONPATH=src python -m labyrinth_nn.export.export_onnx \
 
 ### Phase 5 · Path B 离线真实地图回放基准（可选）
 
-当 `$DRIVE_ROOT/replays.jsonl` 就绪时，可参照 [notebooks/colab_labyrinth_pipeline.ipynb](notebooks/colab_labyrinth_pipeline.ipynb) Cell 7 执行策略对照：
+当 `$DRIVE_ROOT/replays.jsonl` 就绪时，可参照 [notebooks/colab_labyrinth_pipeline.ipynb](notebooks/colab_labyrinth_pipeline.ipynb) Cell 8 执行策略对照与封存评估：
 
 ```bash
 PYTHONPATH=src python -c "
@@ -238,24 +207,37 @@ for name, rep in reports.items():
 
 自动监督 Agent 每次巡检按以下顺序核对 `$DRIVE_ROOT` 文件存在性、修改时间与内容：
 
-1. **前置资源**：核对 `$DRIVE_ROOT/master_cn.db` 与缓存服务端压缩包。各端口启动后，核对本地工作目录及 `/tmp/pcr_calc_persistent_<port>/prod202611131613.db`。
+1. **前置资源**：核对 `$DRIVE_ROOT/master_cn.db`、服务端 ZIP、wheelhouse 与持久缓存 tar 的 SHA256。各端口启动后，核对本地工作目录及 `/tmp/pcr_calc_persistent_<port>/prod202611131613.db`。
 2. **目录阶段**：`$DATA_DIR/feature_pack.json` 是否存在且与 `master_cn.db` 版本一致。
 3. **采样阶段**：按轮次核对 manifest、分片行数和 SHA256；对比唯一成功样本数与该阶段目标。
 4. **训练阶段**：检查 `$RUNS_DIR/ablation_round0/{m0,m1,m2a,m2b}/seed_*/{last.pt,best.pt,test_metrics.json}` 及 `ablation_summary.md`；读取已完成的 `test_metrics.json` 汇报当前最佳验证 NLL 与测试切片表现。
 5. **导出阶段**：检查 `$EXPORT_DIR/*/{tower_a.onnx,tower_b.onnx,manifest.json,golden_io.json}`，核验 `manifest.json` 的 `validation.max_abs_diff` 及文件总大小。
+6. **状态回执**：检查 `$STATUS_DIR/latest_receipt.json` 及本阶段门禁报告，核对锁定提交、已同步产物、实测花费、余额和阻塞。
 
 ### 4.2 自动恢复规则
 
-- **采样中断恢复**：先将 Drive 上该前缀的 JSONL 全部复制回本地，包括主文件、分片、隔离失败日志和对应的 `.manifest.json`。以相同 `--out`、`--seed`、`--round-id` 及 `--resume` 恢复。完成后回写全部分片和 manifest。训练只传入主文件和 `.part-*.jsonl`。
-- **训练中断恢复**：检查对应 `<mode>/seed_<seed>/last.pt` 是否存在；存在时使用 `--config` + 单一 `--seeds` + `--resume .../last.pt` 续训，并确保 `--samples` 传入与中断前完全相同的分片集合。
+- **计划内接力**：单段由 `--max-seconds 10800` 控制，新分片通过 `--sync-dir "$DATA_DIR"` 即时原子发布。核对 Drive 上的全部分片及 manifest 后，用 `--stop-only` 停服并释放运行时。计划接力不计入故障恢复次数。
+- **采样异常恢复**：超时后先停服，检查模拟器日志和已落盘分片。按 Cell 5 校验和恢复主文件、分片、隔离失败日志及 manifest，仍用相同 `--out`、`--seed`、`--round-id` 和 `--resume`。禁止自动重发超时请求。异常恢复最多三次。
+- **训练中断恢复**：使用 `--auto-resume --split-seed 42` 和原有配置、种子列表、完整训练分片及输出目录，按各配置和种子的 `last.pt` 续训。
+
+```bash
+bash scripts/colab_setup_simulator.sh --port 8080 --stop-only
+python -m labyrinth_nn.data.s0_preburn update-receipt \
+  --receipt "$STATUS_DIR/latest_receipt.json" --locked-commit "$LOCKED_COMMIT" \
+  --current-stage S0 --stage-name S0 \
+  --artifact-key s0_cpu_cost --artifact-value "$STATUS_DIR/s0_cpu_cost.json" \
+  --note "已同步 CPU 成本门禁报告"
+```
+
+按实际情况填写 `--stage-status`、`--stage-cc`、`--observed-balance-cc`，记录 `--blocker` 或在解除后传 `--clear-blocker`。Notebook Cell 9 更新回执并调用 `runtime.unassign()`，随后核对活跃会话为 0。
 
 ### 4.3 立即停止并上报条件（禁止盲目循环重试）
 
 出现以下任一异常时，监督 Agent 必须停止当前步骤并向用户告警：
 1. `probe_simulator` 检查失败（`"passed": false`）或 `PCRCalculatorServer` 进程反复退出（附带 `/tmp/pcr_calc_server_<port>.log` 末尾日志）。
-2. 训练出现非有限数值异常（`non-finite training loss` / `non-finite selection NLL`）或连续未完成且无法通过 `--resume` 推进。
+2. 训练出现非有限数值异常（`non-finite training loss` / `non-finite selection NLL`）或连续未完成且无法通过 `--auto-resume` 推进。
 3. 消融结论异常：例如 `m2b` 在 `gold_unknown` 或 `boss_5f_d5` 等核心切片上明显劣于 `m0` 基线。
-4. ONNX 导出数值对齐失败（`max_abs_diff >= 1e-4`）或双塔模型合计超过 `10MB`。
+4. ONNX 导出数值对齐失败（`max_abs_diff >= 1e-4`）或双塔模型合计达到或超过 `10,000,000` 字节。
 
 ### 4.4 Git 仓库卫生护栏
 
@@ -277,28 +259,48 @@ for name, rep in reports.items():
 | **C1 · 条件定向补采** | **4.5** | 开发集证实普通负例不足、机器人边界不稳定或伤害标签需修正时，最多追加 **90k → 340k 累计**（最多约 360k 子局）。金币遮蔽评估可复用现有标签。 |
 | **C2 · 条件最终拟合** | **4.0** | C1 实际改变数据，或合格教师表明学生仍有明确收益时，最多做 4 次 340k 等效训练。单模型达到开发门禁即停止。 |
 
-### S1 / S2 执行参考命令（CPU 采样与 T4 选型解耦）
+### S0 收尾参考命令（先 CPU，再切换 T4）
+
+先完成第 3 节的环境、数据审计和 64 子局探针。CPU Runtime 热身 8 行后测至少 200 行，再停服并释放该会话。T4 Runtime 重新安装或复用 wheelhouse 后，对第 3 节收集的同一组 Pilot 分片跑两轮短测。命令中的 0.08 与 1.17 为参考小时费率，执行时使用实测速率。保存并打印完整 JSON，核对预计 S1 不超过 2.5 CC、S2 不超过 3.5 CC，再更新回执。
 
 ```bash
-# S1（CPU Runtime）：Round 1 覆盖 10 公会 + 同上下文 4 候选配对 + 坏样本隔离续采
-cp -f "$DATA_DIR"/round1_scale*.jsonl "$DATA_DIR"/round1_scale*.json /tmp/ 2>/dev/null || true
-PYTHONPATH=src python -m labyrinth_nn.data.sampler \
-  --catalog "$DATA_DIR/feature_pack.json" \
-  --profile configs/sim_profile_round1_cn.json \
-  --sampling configs/sampling_round1.json \
-  --url http://127.0.0.1:8080 \
-  --out /tmp/round1_scale.jsonl \
-  --target-battles 125000 \
-  --isolate-errors \
-  --resume
-cp -f /tmp/round1_scale*.jsonl /tmp/round1_scale*.json "$DATA_DIR/"
+# CPU Runtime
+python -m labyrinth_nn.data.s0_preburn cpu-cost \
+  --catalog "$DATA_DIR/feature_pack.json" --profile configs/sim_profile_round1_cn.json \
+  --sampling configs/sampling_round1.json --url http://127.0.0.1:8080 \
+  --probe-bench-count 64 --probe-out "$DATA_DIR/probe_round1.json" \
+  --warmup-rows 8 --rows 200 --batch-size 8 --concurrency 1 --timeout-sec 120 \
+  --sim-log /tmp/pcr_calc_server_8080.log --cpu-cc-per-hour 0.08 \
+  --out "$STATUS_DIR/s0_cpu_cost.json"
+cat "$STATUS_DIR/s0_cpu_cost.json"
+bash scripts/colab_setup_simulator.sh --port 8080 --stop-only
 
-# S2（T4 GPU Runtime）：冻结上下文划分上对比 m1 / m2b / m2b_r1 / m2b_r1_dmg025（含 counterfactual gold_unknown）
-PYTHONPATH=src python -m labyrinth_nn.train.train_critic \
+# 切换至 T4 GPU Runtime 后，重跑 Cell 1 并按 Phase 0 重建 pilot_shards 数组。
+python -m labyrinth_nn.data.s0_preburn t4-timing \
+  --catalog "$DATA_DIR/feature_pack.json" --config configs/critic_m2b_r1.json \
+  --samples "${pilot_shards[@]}" --epochs 2 --device cuda --amp --pin-memory \
+  --group-by context --t4-cc-per-hour 1.17 --out "$STATUS_DIR/s0_t4_timing.json"
+cat "$STATUS_DIR/s0_t4_timing.json"
+```
+
+### S1 / S2 执行参考命令（CPU 采样与 T4 选型解耦）
+
+同一时间只保留一个 Colab 运行时。不同采样工作者可分段顺序运行，继续使用各自固定的标识和输出前缀。
+
+```bash
+# S1 CPU Runtime。先按 Cell 5 校验并恢复已有分片、manifest 和失败日志。
+python -m labyrinth_nn.data.sampler \
+  --catalog "$DATA_DIR/feature_pack.json" \
+  --profile configs/sim_profile_round1_cn.json --sampling configs/sampling_round1.json \
+  --url http://127.0.0.1:8080 --out /tmp/limingjienn-samples/round1_scale.jsonl \
+  --target-battles 125000 --batch-size 16 --concurrency 1 --timeout-sec 120 \
+  --sync-dir "$DATA_DIR" --max-seconds 10800 --progress --isolate-errors --resume
+bash scripts/colab_setup_simulator.sh --port 8080 --stop-only
+
+# S2 T4 GPU Runtime。先用 Cell 6 校验每个 TRAIN_PREFIXES 条目的 manifest 和 SHA256。
+python -m labyrinth_nn.train.train_critic \
   --config-files configs/critic_m1.json configs/critic_m2b.json configs/critic_m2b_r1.json configs/critic_m2b_r1_dmg025.json \
-  --seeds 42 43 \
-  --group-by context \
-  --amp \
+  --seeds 42 43 --split-seed 42 --group-by context --auto-resume --amp --device cuda --pin-memory \
   --catalog "$DATA_DIR/feature_pack.json" \
   --samples "$DATA_DIR"/round0_pilot.jsonl "$DATA_DIR"/round0_pilot.part-*.jsonl "$DATA_DIR"/round1_scale.jsonl "$DATA_DIR"/round1_scale.part-*.jsonl \
   --out-dir "$RUNS_DIR/ablation_round1"

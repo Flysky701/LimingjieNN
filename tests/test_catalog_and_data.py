@@ -7,6 +7,7 @@ import io
 import json
 import math
 import os
+import shutil
 import sqlite3
 import statistics
 import tempfile
@@ -14,12 +15,13 @@ import threading
 import unittest
 import uuid
 from collections import Counter, defaultdict
-from contextlib import closing, contextmanager, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
+from urllib.error import URLError
 
 from labyrinth_nn.catalog.build_catalog import build_catalog
 from labyrinth_nn.catalog.schema import ENEMY_STATIC_FEAT_NAMES, UNIT_MECH_FLAG_NAMES, UNIT_STATIC_FEAT_NAMES
@@ -27,7 +29,7 @@ from labyrinth_nn.data import probe_simulator, sampler
 from labyrinth_nn.data.dataset import split_samples
 from labyrinth_nn.data.sample_schema import BattleSample, OUTCOME_TIMEOUT, OUTCOME_WIN, SingleRunResult, read_samples
 from labyrinth_nn.data.sim_client import (
-    PcrCalculatorClient, SimClient, SimulationConfig, SimulationError, build_simulate_payload,
+    PcrCalculatorClient, SimClient, SimulationConfig, SimulationError, SimulationTimeoutError, build_simulate_payload,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -172,7 +174,7 @@ def create_fixture(path: Path) -> None:
 
 
 @contextmanager
-def mock_server(catalog, *, respond=None):
+def mock_server(catalog, *, respond=None, withhold_response=None):
     requests = []
     lock = threading.Lock()
     next_seed = 4000
@@ -203,6 +205,9 @@ def mock_server(catalog, *, respond=None):
                         "CurrentSeed": seed, "Stats": {"TotalDamage": seed * 100},
                     }
                     result.append(respond(query, row, len(requests)) if respond is not None else row)
+            if withhold_response is not None:
+                withhold_response.wait(timeout=5)
+                return
             encoded = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -347,9 +352,12 @@ class CatalogTests(FixtureCase):
 
 class RealCatalogTests(unittest.TestCase):
     def test_real_cn_catalog(self):
-        paths = [p for p in REAL_DATABASES if p.is_file()]
+        candidates = [ROOT / "artifacts/colab_upload/LimingjieNN/master_cn.db", *REAL_DATABASES]
+        if configured := os.environ.get("CN_DB_PATH"):
+            candidates.insert(0, Path(configured))
+        paths = dict.fromkeys(path.resolve() for path in candidates if path.is_file())
         if not paths:
-            self.skipTest("neither supported CN master database is present")
+            self.skipTest("no supported CN master database is present")
         for path in paths:
             with self.subTest(database=str(path)):
                 c = build_catalog(path)
@@ -404,6 +412,36 @@ class RealCatalogTests(unittest.TestCase):
 
 
 class SimClientTests(FixtureCase):
+    def test_http_timeout_retries_only_when_enabled(self):
+        config = SimulationConfig(self.catalog.quests[NORMAL], [1, 2])
+        options = {"timeout_sec": 0.2, "max_retries": 2}
+        for kind, expected_requests in (("default", 1), ("explicit", 3), ("profile", 3)):
+            with self.subTest(kind=kind):
+                release = threading.Event()
+                with mock_server(self.catalog, withhold_response=release) as (url, requests):
+                    if kind == "profile":
+                        client = SimClient(url, self.catalog, self.profile | options | {"retry_on_timeout": True})
+                    else:
+                        kwargs = {"retry_on_timeout": True} if kind == "explicit" else {}
+                        client = PcrCalculatorClient(url, catalog=self.catalog, **options, **kwargs)
+                    try:
+                        with self.assertRaises(SimulationTimeoutError) as error:
+                            client.simulate_batch_single_runs([config])
+                        self.assertIsInstance(error.exception, SimulationError)
+                        self.assertEqual(len(requests), expected_requests)
+                    finally:
+                        release.set()
+
+    def test_wrapped_timeout_is_not_retried_by_default(self):
+        error = URLError(TimeoutError("timed out"))
+        client = PcrCalculatorClient("http://127.0.0.1:8080", max_retries=2, catalog=self.catalog)
+        config = SimulationConfig(self.catalog.quests[NORMAL], [1, 2])
+        with patch("labyrinth_nn.data.sim_client.urlopen", side_effect=error) as post:
+            with self.assertRaisesRegex(SimulationTimeoutError, "timed out") as raised:
+                client.simulate_batch_single_runs([config])
+        post.assert_called_once()
+        self.assertIs(raised.exception.__cause__, error)
+
     def test_public_payload_builder_and_raw_batch_with_catalog(self):
         first = build_simulate_payload(
             catalog=self.catalog, profile=self.profile, quest_id=NORMAL, team_unit_ids=[1, 2],
@@ -687,6 +725,9 @@ class SamplerTests(FixtureCase):
         bad_id = list(planner._unique(2, set()))[-1][0].sample_id
         path = self.root / "isolation.jsonl"
         failure_log = self.root / "isolation.failed.jsonl"
+        sync_dir = self.root / "isolation-sync"
+        sync_dir.mkdir()
+        self.addCleanup(shutil.rmtree, sync_dir)
 
         def simulate(_client, batch):
             if any(s.sample_id == bad_id for s in batch):
@@ -695,10 +736,11 @@ class SamplerTests(FixtureCase):
 
         planner = sampler.HighScoreSampler(self.catalog, self.profile, config)
         with patch.object(planner, "simulate_samples", side_effect=simulate):
-            result = planner.collect(None, path, 4, failure_log=failure_log)
+            result = planner.collect(None, path, 4, failure_log=failure_log, sync_dir=sync_dir)
         self.assertEqual((result["new_battles"], result["failed_battles"], result["new_shards"]), (3, 1, 2))
         self.assertEqual([json.loads(line) for line in failure_log.read_text(encoding="utf-8").splitlines()],
                          [{"sample_id": bad_id, "error": "malformed battle result"}])
+        self.assertEqual((sync_dir / failure_log.name).read_bytes(), failure_log.read_bytes())
         resume = sampler.HighScoreSampler(self.catalog, self.profile, config)
         with patch.object(resume, "simulate_samples", side_effect=simulate):
             result = resume.collect(None, path, 4, resume=True, failure_log=failure_log)
@@ -716,6 +758,198 @@ class SamplerTests(FixtureCase):
             ids.update(sample.sample_id for sample in read_samples(shard))
         self.assertEqual(len(ids), 4)
         self.assertNotIn(bad_id, ids)
+
+    def test_timeout_flushes_and_syncs_without_isolation_and_can_resume(self):
+        config = self.config | {"isolate_batch_errors": True, "batch_size": 2, "chunk_size": 10, "concurrency": 1}
+        path = self.root / "timeout.jsonl"
+        manifest = self.root / "timeout.manifest.json"
+        failure_log = self.root / "timeout.failed.jsonl"
+        sync_dir = self.root / "timeout-sync"
+        sync_dir.mkdir()
+        self.addCleanup(shutil.rmtree, sync_dir)
+        sync_order = []
+        sync_file = sampler._sync_file_atomic
+
+        def sync(source, destination):
+            sync_order.append(source.name)
+            if source == manifest:
+                entries = json.loads(source.read_text(encoding="utf-8"))["shards"]
+                for entry in entries:
+                    shard = destination / entry["filename"]
+                    self.assertEqual(hashlib.sha256(shard.read_bytes()).hexdigest(), entry["sha256"])
+            return sync_file(source, destination)
+
+        def simulate(_client, batch):
+            if simulated.call_count == 2:
+                raise SimulationTimeoutError("timed out")
+            return batch
+
+        planner = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        with (patch.object(planner, "simulate_samples", side_effect=simulate) as simulated,
+              patch.object(sampler, "_sync_file_atomic", side_effect=sync)):
+            with self.assertRaisesRegex(SimulationTimeoutError, "timed out"):
+                planner.collect(None, path, 6, failure_log=failure_log, sync_dir=sync_dir)
+        self.assertEqual([len(call.args[1]) for call in simulated.call_args_list], [2, 2])
+        self.assertEqual(sync_order, [path.name, manifest.name])
+        self.assertFalse(failure_log.exists())
+        self.assertFalse((sync_dir / failure_log.name).exists())
+        self.assertEqual(len(read_samples(path)), 2)
+        self.assertEqual(json.loads(manifest.read_text(encoding="utf-8"))["total_unique_battles"], 2)
+        self.assertEqual((sync_dir / manifest.name).read_bytes(), manifest.read_bytes())
+
+        resume = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        with (patch.object(resume, "simulate_samples", side_effect=lambda _client, batch: batch),
+              patch.object(sampler, "_sync_file_atomic", side_effect=sync)):
+            result = resume.collect(None, path, 6, resume=True, failure_log=failure_log, sync_dir=sync_dir)
+        self.assertEqual((result["existing_battles"], result["total_battles"], result["failed_battles"]), (2, 6, 0))
+        records = read_samples(path) + read_samples(self.root / "timeout.part-00001.jsonl")
+        expected = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        self.assertEqual([row.sample_id for row in records], [expected.draw()[0].sample_id for _ in range(6)])
+        self.assertEqual((sync_dir / manifest.name).read_bytes(), manifest.read_bytes())
+
+    def test_keyboard_interrupt_during_sync_retries_shard_before_manifest(self):
+        config = self.config | {"batch_size": 2, "chunk_size": 2, "concurrency": 1}
+        planner = sampler.HighScoreSampler(self.catalog, self.profile, config)
+        path = self.root / "keyboard-interrupt.jsonl"
+        manifest = self.root / "keyboard-interrupt.manifest.json"
+        sync_dir = self.root / "keyboard-interrupt-sync"
+        sync_dir.mkdir()
+        self.addCleanup(shutil.rmtree, sync_dir)
+        sync_file = sampler._sync_file_atomic
+
+        def sync(source, destination):
+            if sync_attempt.call_count == 1:
+                raise KeyboardInterrupt
+            if source == manifest:
+                self.assertEqual((destination / path.name).read_bytes(), path.read_bytes())
+            return sync_file(source, destination)
+
+        with (patch.object(planner, "simulate_samples", side_effect=lambda _client, batch: batch),
+              patch.object(sampler, "_sync_file_atomic", side_effect=sync) as sync_attempt):
+            with self.assertRaises(KeyboardInterrupt):
+                planner.collect(None, path, 2, sync_dir=sync_dir)
+        self.assertEqual([call.args[0] for call in sync_attempt.call_args_list], [path, path, manifest])
+        self.assertEqual((sync_dir / manifest.name).read_bytes(), manifest.read_bytes())
+
+    def test_sync_file_skips_matches_and_replaces_atomically(self):
+        source = self.root / "atomic-source.jsonl"
+        source.write_bytes(b"old data")
+        parent = self.root / "atomic-sync"
+        parent.mkdir()
+        self.addCleanup(shutil.rmtree, parent)
+        sync_dir = parent / "destination"
+        self.assertFalse(sampler._sync_file_atomic(self.root / "missing.jsonl", sync_dir))
+        self.assertFalse(sync_dir.exists())
+        self.assertTrue(sampler._sync_file_atomic(source, sync_dir))
+        destination = sync_dir / source.name
+        with patch.object(shutil, "copy2") as copy:
+            self.assertFalse(sampler._sync_file_atomic(source, source.parent / "."))
+            self.assertFalse(sampler._sync_file_atomic(source, sync_dir))
+            copy.assert_not_called()
+
+        source.write_bytes(b"new data")
+        replace_file = os.replace
+
+        def publish(temporary, dst):
+            self.assertEqual(temporary.parent, sync_dir)
+            self.assertEqual(dst, destination)
+            self.assertEqual(dst.read_bytes(), b"old data")
+            self.assertEqual(temporary.read_bytes(), b"new data")
+            replace_file(temporary, dst)
+
+        with patch.object(os, "replace", side_effect=publish) as publish_file:
+            self.assertTrue(sampler._sync_file_atomic(source, sync_dir))
+        publish_file.assert_called_once()
+        self.assertEqual(destination.read_bytes(), b"new data")
+        source.write_bytes(b"unpublished data")
+        with patch.object(os, "replace", side_effect=OSError(errno.EIO, "I/O error")):
+            with self.assertRaisesRegex(OSError, "I/O error"):
+                sampler._sync_file_atomic(source, sync_dir)
+        self.assertEqual(destination.read_bytes(), b"new data")
+        self.assertEqual(list(sync_dir.iterdir()), [destination])
+
+    def test_cli_time_limit_telemetry_overrides_and_resume(self):
+        catalog_path = self.catalog.save(self.root / "timed-catalog.json")
+        profile_path = self.root / "timed-profile.json"
+        profile = self.profile | {"adaptive_repeat": {"initial_runs": 1, "borderline_runs": 3}}
+        profile_path.write_text(json.dumps(profile), encoding="utf-8")
+        path = self.root / "timed.jsonl"
+        sync_dir = self.root / "timed-sync"
+        sync_dir.mkdir()
+        self.addCleanup(shutil.rmtree, sync_dir)
+        args = ["--catalog", str(catalog_path), "--profile", str(profile_path), "--sampling", str(SAMPLING),
+                "--out", str(path), "--target-battles", "7", "--chunk-size", "2", "--batch-size", "2",
+                "--concurrency", "2", "--timeout-sec", "3.25", "--max-seconds", "1", "--progress"]
+        run = SingleRunResult(1, 0, OUTCOME_WIN, 1800, 90, 30, 2 / 3, 100, 1.0)
+
+        def simulate(_planner, client, batch):
+            self.assertEqual(client.timeout, 3.25)
+            return [replace(sample, runs=[run] if i else [replace(run, seed=s) for s in (1, 2, 3)])
+                    for i, sample in enumerate(batch)]
+
+        def invoke(extra_args, ticks):
+            with (patch.object(sampler, "time") as clock,
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as progress):
+                clock.monotonic.side_effect = ticks
+                self.assertEqual(sampler.main(args + extra_args), 0)
+            return json.loads(output.getvalue()), progress.getvalue().splitlines()
+
+        with (patch.object(sampler.HighScoreSampler, "simulate_samples", autospec=True, side_effect=simulate) as calls,
+              patch.object(sampler.HighScoreSampler, "draw", autospec=True,
+                           side_effect=sampler.HighScoreSampler.draw) as draw):
+            first, progress = invoke(["--sync-dir", str(sync_dir)], [100, 100, 102, 102])
+            self.assertEqual(draw.call_count, 4)
+            self.assertEqual([len(call.args[2]) for call in calls.call_args_list], [2, 2])
+            calls.reset_mock()
+            resumed, _ = invoke(["--sync-dir", str(sync_dir), "--resume"], [200, 200, 202])
+            self.assertCountEqual([len(call.args[2]) for call in calls.call_args_list], [2, 1])
+            calls.reset_mock()
+            new_sync_dir = sync_dir / "complete"
+            complete, _ = invoke(["--sync-dir", str(new_sync_dir), "--resume"], [300, 302])
+            calls.assert_not_called()
+
+        self.assertTrue(first["stopped_by_time_limit"])
+        self.assertFalse(resumed["stopped_by_time_limit"])
+        self.assertFalse(complete["stopped_by_time_limit"])
+        self.assertEqual(len(progress), 2)
+        self.assertIn("Collected 2/7 battles", progress[0])
+        self.assertIn("Collected 4/7 battles", progress[1])
+        self.assertEqual(first["existing_battles"], 0)
+        self.assertEqual(first["new_battles"], 4)
+        for field, expected in {"existing_subruns": 0, "new_subruns": 8, "total_subruns": 8,
+                                "repeated_battles": 2, "repeat_rate": 0.5, "elapsed_sec": 2.0,
+                                "rows_per_sec": 2.0, "subruns_per_sec": 4.0}.items():
+            with self.subTest(field=field):
+                self.assertEqual(first[field], expected)
+        self.assertEqual((resumed["existing_battles"], resumed["new_battles"], resumed["total_battles"]), (4, 3, 7))
+        self.assertEqual((resumed["existing_subruns"], resumed["new_subruns"], resumed["total_subruns"]), (8, 7, 15))
+        self.assertEqual((complete["new_battles"], complete["existing_subruns"], complete["new_subruns"]), (0, 15, 0))
+
+        manifest = self.root / "timed.manifest.json"
+        entries = json.loads(manifest.read_text(encoding="utf-8"))["shards"]
+        records = []
+        for name in [entry["filename"] for entry in entries] + [manifest.name]:
+            source = self.root / name
+            self.assertEqual((sync_dir / name).read_bytes(), source.read_bytes())
+            self.assertEqual((new_sync_dir / name).read_bytes(), source.read_bytes())
+            if source != manifest:
+                records.extend(read_samples(source))
+        fresh = sampler.HighScoreSampler(self.catalog, profile, self.config)
+        self.assertEqual([row.sample_id for row in records], [fresh.draw()[0].sample_id for _ in range(7)])
+        self.assertEqual(first["buckets_new"], dict(Counter(row.bucket for row in records[:4])))
+        self.assertEqual(first["guilds_new"], dict(Counter(str(row.guild_id) for row in records[:4])))
+
+    def test_collect_and_cli_validate_positive_limits(self):
+        planner = sampler.HighScoreSampler(self.catalog, self.profile, self.config)
+        with self.assertRaisesRegex(ValueError, "max_seconds must be positive"):
+            planner.collect(None, self.root / "invalid.jsonl", 1, max_seconds=0)
+        for flag, name in (("--batch-size", "batch_size"), ("--concurrency", "concurrency"),
+                           ("--timeout-sec", "timeout_sec"), ("--max-seconds", "max_seconds")):
+            with self.subTest(flag=flag), redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit) as raised:
+                    sampler.main(["--catalog", "unused.json", "--dry-run", "1", flag, "0"])
+                self.assertEqual(raised.exception.code, 1)
+                self.assertIn(f"{name} must be positive", error.getvalue())
 
     def test_shard_publish_fallback_checks_errno_and_existing_path(self):
         path = self.root / "fallback.jsonl"

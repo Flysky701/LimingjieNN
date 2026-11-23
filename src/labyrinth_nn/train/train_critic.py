@@ -10,7 +10,9 @@ import statistics
 import tempfile
 from collections.abc import Sequence
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
+from pickle import UnpicklingError
 from typing import Any
 
 import torch
@@ -28,8 +30,21 @@ CONFIG_DIR = Path(__file__).resolve().parents[3] / "configs"
 LOSS_COMPONENTS = ("outcome_loss", "damage_loss", "damage_huber", "damage_nll", "time_loss", "affinity_loss")
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False, mode="w", encoding="utf-8", newline="\n") as tmp:
+            temp_path = Path(tmp.name)
+            tmp.write(text)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _write_json(path: Path, payload) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+    _write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def _save_checkpoint(path: Path, payload) -> None:
@@ -55,6 +70,34 @@ def split_training_samples(samples, config, split_seed, group_by="wave_team"):
     if config.test_ratio and not parts["test"]:
         raise ValueError(f"the requested test split has no labeled {group_by} group")
     return parts
+
+
+def _split_digest(parts) -> str:
+    # Stable hash ordering alone cannot protect a resumed holdout if groups were added or removed.
+    partition = hashlib.sha256()
+    for name, rows in parts.items():
+        for sample in rows:
+            identity = (name, sample.sample_id, sample.canonical_wave_sig, sample.canonical_team_sig())
+            partition.update(json.dumps(identity, ensure_ascii=False).encode("utf-8") + b"\n")
+    return partition.hexdigest()
+
+
+def _same_training_config(saved, config: CriticConfig, catalog: FeatureCatalog) -> bool:
+    saved_config = CriticConfig.from_dict(saved, catalog).to_dict()
+    current_config = config.to_dict()
+    saved_config.pop("epochs")
+    current_config.pop("epochs")
+    return saved_config == current_config
+
+
+def _make_loader(config, catalog, rows, *, seed, num_workers, pin_memory, shuffle=None, cache_eval=False):
+    training = shuffle is not None
+    dataset = BattleDataset(catalog, rows, seed=seed, training=training, cache_eval=cache_eval,
+                            relic_max_len=config.relic_max_len, roster_max_len=config.roster_max_len,
+                            unit_id_dropout=config.unit_id_dropout, relic_id_mask_prob=config.relic_id_mask_prob,
+                            relic_stack_noise_prob=config.relic_stack_noise_prob, gold_mask_prob=config.gold_mask_prob)
+    return DataLoader(dataset, batch_size=config.batch_size, shuffle=training,
+                      collate_fn=collate_battle_batch, generator=shuffle, num_workers=num_workers, pin_memory=pin_memory)
 
 
 def _validate_samples(samples: Sequence[BattleSample]) -> None:
@@ -145,13 +188,7 @@ def train_critic(config: CriticConfig | str | Path, catalog: FeatureCatalog | st
     seed = state.get("seed", 42) if seed is None else seed
     split_seed = state.get("split_seed", seed) if split_seed is None else split_seed
     parts = split_training_samples(samples, config, split_seed, group_by=group_by)
-    # Stable hash ordering alone cannot protect a resumed holdout if groups were added or removed.
-    partition = hashlib.sha256()
-    for name, rows in parts.items():
-        for sample in rows:
-            identity = (name, sample.sample_id, sample.canonical_wave_sig, sample.canonical_team_sig())
-            partition.update(json.dumps(identity, ensure_ascii=False).encode("utf-8") + b"\n")
-    split_digest = partition.hexdigest()
+    split_digest = _split_digest(parts)
     data_dir = Path(out_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     catalog_hash = catalog.catalog_sha256 or catalog.compute_sha256()
@@ -160,16 +197,9 @@ def train_critic(config: CriticConfig | str | Path, catalog: FeatureCatalog | st
         raise ValueError("AMP training supports CUDA float16 and CPU bfloat16")
     torch.manual_seed(seed)
     shuffle = torch.Generator()
-    def make_loader(rows, *, training=False, cache_eval=False):
-        dataset = BattleDataset(catalog, rows, seed=seed, training=training, cache_eval=cache_eval,
-                                relic_max_len=config.relic_max_len, roster_max_len=config.roster_max_len,
-                                unit_id_dropout=config.unit_id_dropout, relic_id_mask_prob=config.relic_id_mask_prob,
-                                relic_stack_noise_prob=config.relic_stack_noise_prob, gold_mask_prob=config.gold_mask_prob)
-        return DataLoader(dataset, batch_size=config.batch_size, shuffle=training,
-                          collate_fn=collate_battle_batch, generator=shuffle if training else None,
-                          num_workers=num_workers, pin_memory=pin_memory)
-
-    loaders = {name: make_loader(rows, training=name == "train", cache_eval=name != "train")
+    loader_options = dict(seed=seed, num_workers=num_workers, pin_memory=pin_memory)
+    loaders = {name: _make_loader(config, catalog, rows, shuffle=shuffle if name == "train" else None,
+                                  cache_eval=name != "train", **loader_options)
                for name, rows in parts.items()}
     model = TwoTowerBattleCritic(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
@@ -185,8 +215,7 @@ def train_critic(config: CriticConfig | str | Path, catalog: FeatureCatalog | st
     best_epoch = start_epoch = stale = 0
     history = []
     if resume is not None:
-        saved_config = CriticConfig.from_dict(state["config"], catalog).to_dict()
-        same_config = all(saved_config[k] == v for k, v in config.to_dict().items() if k != "epochs")
+        same_config = _same_training_config(state["config"], config, catalog)
         if ((state["catalog_sha256"], state["seed"], state["split_seed"]) != (catalog_hash, seed, split_seed)
                 or not same_config):
             raise ValueError("checkpoint catalog, seeds or training configuration differ")
@@ -268,11 +297,12 @@ def train_critic(config: CriticConfig | str | Path, catalog: FeatureCatalog | st
     calibration = fit_temperature(model, loaders["val_calib"], device) if parts["val_calib"] else None
     records = predict_records(model, loaders["test"], device)
     metrics = evaluate_predictions(records)
-    masked_loader = make_loader([mask_gold_sample(sample) for sample in parts["test"]])
+    masked_loader = _make_loader(config, catalog, [mask_gold_sample(sample) for sample in parts["test"]], **loader_options)
     masked_records = predict_records(model, masked_loader, device)
     best_path = data_dir / "best.pt"
     state["resume_model"] = state["model"]
     state["model"] = model.state_dict()
+    state["calibration"] = calibration
     _save_checkpoint(best_path, state)
     report = {
         "ablation_mode": config.ablation_mode, "seed": seed, "split_seed": split_seed, "group_by": group_by,
@@ -283,6 +313,75 @@ def train_critic(config: CriticConfig | str | Path, catalog: FeatureCatalog | st
     }
     _write_json(data_dir / "test_metrics.json", report)
     return {**report, "test_predictions": records, "counterfactual_predictions": masked_records}
+
+
+def _load_completed_run(config, catalog, samples, run_dir, *, seed, split_seed, device, patience, num_workers,
+                        pin_memory, group_by) -> dict[str, Any] | None:
+    run_dir = Path(run_dir)
+    best_path = run_dir / "best.pt"
+    metrics_path = run_dir / "test_metrics.json"
+    if not best_path.is_file() or not metrics_path.is_file():
+        return None
+    if min(config.epochs, config.batch_size, patience) < 1 or num_workers < 0:
+        return None
+
+    catalog_hash = catalog.catalog_sha256 or catalog.compute_sha256()
+    try:
+        state = torch.load(best_path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            return None
+        if (state.get("catalog_sha256"), state.get("seed"), state.get("split_seed"),
+                state.get("group_by", "wave_team")) != (catalog_hash, seed, split_seed, group_by):
+            return None
+        if not (state["epoch"] >= config.epochs or state["stale"] >= patience):
+            return None
+        saved_config = state["config"]
+        if not isinstance(saved_config, dict) or not _same_training_config(saved_config, config, catalog):
+            return None
+        best_epoch, history = state["best_epoch"], state["history"]
+    except (OSError, EOFError, RuntimeError, UnpicklingError, KeyError, TypeError, ValueError):
+        return None
+
+    parts = split_training_samples(samples, config, split_seed, group_by=group_by)
+    if state.get("split_sha256") != _split_digest(parts):
+        return None
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model = TwoTowerBattleCritic(config).to(device)
+    try:
+        model.load_state_dict(state["model"])
+    except (KeyError, RuntimeError, TypeError):
+        return None
+    loader_options = dict(seed=seed, num_workers=num_workers, pin_memory=pin_memory)
+    test_loader = _make_loader(config, catalog, parts["test"], cache_eval=True, **loader_options)
+    masked_loader = _make_loader(config, catalog, [mask_gold_sample(sample) for sample in parts["test"]], **loader_options)
+    records = predict_records(model, test_loader, device)
+    masked_records = predict_records(model, masked_loader, device)
+
+    identity = {
+        "ablation_mode": config.ablation_mode, "seed": seed, "split_seed": split_seed, "group_by": group_by,
+        "split_counts": {name: len(rows) for name, rows in parts.items()}, "best_epoch": best_epoch,
+    }
+    try:
+        report = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        report = None
+    # An interrupted update can leave metrics from an earlier epoch with the same best_epoch.
+    if (not isinstance(report, dict) or any(report.get(k) != v for k, v in identity.items())
+            or report.get("history", history) != history):
+        report = identity
+    report["history"] = history
+    if "metrics" not in report:
+        report["metrics"] = evaluate_predictions(records)
+    if "counterfactual_gold_unknown" not in report:
+        report["counterfactual_gold_unknown"] = _counterfactual_metrics(masked_records)
+    if "calibration" not in report:
+        calibration = state.get("calibration")
+        if "calibration" not in state and "best_model" in state and parts["val_calib"]:
+            model.load_state_dict(state["best_model"])
+            calib_loader = _make_loader(config, catalog, parts["val_calib"], cache_eval=True, **loader_options)
+            calibration = fit_temperature(model, calib_loader, device)
+        report["calibration"] = calibration
+    return {**report, "checkpoint": str(best_path), "test_predictions": records, "counterfactual_predictions": masked_records}
 
 
 def _ensemble_records(members):
@@ -302,10 +401,27 @@ def _ensemble_records(members):
     return averaged
 
 
+def _summary_json_path(root: Path, summary, resume) -> Path:
+    path = root / "ablation_summary.json"
+    if resume is None or not path.is_file():
+        return path
+    modes, seeds = summary["modes"], summary["seeds"]
+    if len(modes) != 1 or len(seeds) != 1:
+        return path
+    mode, seed = next(iter(modes)), seeds[0]
+    existing_modes = json.loads(path.read_text(encoding="utf-8")).get("modes", {})
+    if (any(name != mode for name in existing_modes)
+            or any(run.get("seed") != seed for run in existing_modes.get(mode, {}).get("runs", ()))):
+        return root / mode / f"seed_{seed}" / "resume_summary.json"
+    return path
+
+
 def run_experiments(configs: Sequence[CriticConfig], catalog: FeatureCatalog, samples: Sequence[BattleSample],
                     out_dir: str | Path, *, seeds: Sequence[int] | None = None, split_seed: int | None = None,
                     device=None, amp=False, resume=None, patience=5, num_workers=0, pin_memory=False,
-                    group_by="wave_team"):
+                    group_by="wave_team", auto_resume: bool = False):
+    if resume and auto_resume:
+        raise ValueError("use either --resume or --auto-resume, not both")
     if resume and (seeds is None or split_seed is None):
         metadata = torch.load(resume, map_location="meta", weights_only=True)
         seeds = [metadata["seed"]] if seeds is None else seeds
@@ -319,15 +435,24 @@ def run_experiments(configs: Sequence[CriticConfig], catalog: FeatureCatalog, sa
         raise ValueError("each configuration needs a distinct ablation_mode")
     if resume and len(configs) * len(seeds) != 1:
         raise ValueError("a resume checkpoint identifies one configuration and training seed")
+    if auto_resume:
+        _validate_samples(samples)
     split_seed = seeds[0] if split_seed is None else split_seed
     root = Path(out_dir)
     modes = {}
     for config in configs:
         runs, predictions, masked_predictions = [], [], []
         for seed in seeds:
-            result = train_critic(config, catalog, samples, root / config.ablation_mode / f"seed_{seed}",
-                                  seed=seed, split_seed=split_seed, device=device, amp=amp, resume=resume,
-                                  patience=patience, num_workers=num_workers, pin_memory=pin_memory, group_by=group_by)
+            run_dir = root / config.ablation_mode / f"seed_{seed}"
+            run_options = dict(seed=seed, split_seed=split_seed, device=device, patience=patience,
+                               num_workers=num_workers, pin_memory=pin_memory, group_by=group_by)
+            result = _load_completed_run(config, catalog, samples, run_dir, **run_options) if auto_resume else None
+            if result is None:
+                run_resume = resume
+                if auto_resume:
+                    last_ckpt = run_dir / "last.pt"
+                    run_resume = last_ckpt if last_ckpt.is_file() else None
+                result = train_critic(config, catalog, samples, run_dir, amp=amp, resume=run_resume, **run_options)
             predictions.append(result.pop("test_predictions"))
             masked_predictions.append(result.pop("counterfactual_predictions"))
             runs.append(result)
@@ -340,7 +465,10 @@ def run_experiments(configs: Sequence[CriticConfig], catalog: FeatureCatalog, sa
             "counterfactual_gold_unknown": _counterfactual_metrics(_ensemble_records(masked_predictions)),
         }
     summary = {"split_seed": split_seed, "seeds": list(seeds), "group_by": group_by, "modes": modes}
-    _write_json(root / "ablation_summary.json", summary)
+    summary_path = _summary_json_path(root, summary, resume)
+    _write_json(summary_path, summary)
+    if summary_path.name == "resume_summary.json":
+        return summary
     columns = ("auroc", "brier_3class", "brier_win", "ece_15", "accuracy_3class", "loss_damage_mae",
                "win_time_mae", "group_top1_fpr", "group_top1_pos_fpr")
     lines = ["# 消融对比", "", f"切分种子 {split_seed}，训练种子 {', '.join(map(str, seeds))}。表中为集成预测。", "",
@@ -354,7 +482,7 @@ def run_experiments(configs: Sequence[CriticConfig], catalog: FeatureCatalog, sa
         for name, row in rows.items():
             values = [f"{row[k]:.5f}" if row[k] is not None else "—" for k in columns]
             lines.append(f"| {mode} | {name} | {row['count']} | " + " | ".join(values) + " |")
-    (root / "ablation_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_text_atomic(root / "ablation_summary.md", "\n".join(lines) + "\n")
     return summary
 
 
@@ -366,8 +494,10 @@ def main(argv=None):
     parser.add_argument("--config-files", nargs="+", type=Path)
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--split-seed", type=int, help="common holdout seed (defaults to the first training seed)")
+    parser.add_argument("--epochs", type=int)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--auto-resume", action="store_true")
     parser.add_argument("--device")
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -377,6 +507,8 @@ def main(argv=None):
     parser.add_argument("--samples", type=Path, nargs="+", required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.epochs is not None and args.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
     paths = [args.config] if args.config else [CONFIG_DIR / f"critic_{m}.json" for m in (args.configs or ())]
     paths.extend(args.config_files or ())
     if not paths:
@@ -388,10 +520,14 @@ def main(argv=None):
     _validate_samples(samples)
     catalog = FeatureCatalog.load(args.catalog)
     configs = [CriticConfig.from_json(path, catalog) for path in paths]
-    run_experiments(configs, catalog, samples, args.out_dir, seeds=args.seeds, split_seed=args.split_seed,
-                    device=args.device, amp=args.amp, resume=args.resume, patience=args.patience,
-                    num_workers=args.num_workers, pin_memory=args.pin_memory, group_by=args.group_by)
-    print(args.out_dir / "ablation_summary.md")
+    if args.epochs is not None:
+        configs = [replace(config, epochs=args.epochs) for config in configs]
+    summary = run_experiments(configs, catalog, samples, args.out_dir, seeds=args.seeds, split_seed=args.split_seed,
+                              device=args.device, amp=args.amp, resume=args.resume, patience=args.patience,
+                              num_workers=args.num_workers, pin_memory=args.pin_memory, group_by=args.group_by,
+                              auto_resume=args.auto_resume)
+    summary_path = _summary_json_path(args.out_dir, summary, args.resume)
+    print(summary_path if summary_path.name == "resume_summary.json" else summary_path.with_suffix(".md"))
 
 
 if __name__ == "__main__":

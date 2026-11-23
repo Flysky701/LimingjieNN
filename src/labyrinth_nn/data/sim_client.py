@@ -6,7 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from http.client import HTTPException
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from labyrinth_nn.catalog.schema import EnemyEntry, FeatureCatalog, QuestEntry
@@ -24,6 +24,14 @@ INITIAL_HP_FIELDS = ("initialhp", "maxhp", "starthp", "maxhitpoint")
 
 class SimulationError(RuntimeError):
     """The server did not return a usable battle result."""
+
+
+class SimulationTimeoutError(SimulationError):
+    """The simulator HTTP request timed out while the server may still be running."""
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or (isinstance(exc, URLError) and isinstance(exc.reason, TimeoutError))
 
 
 @dataclass(frozen=True)
@@ -161,12 +169,14 @@ class PcrCalculatorClient:
     def __init__(
         self, base_url: str, timeout_sec: float = 120.0, max_retries: int = 2, *,
         catalog: FeatureCatalog | None = None, profile: Mapping[str, Any] | None = None,
+        retry_on_timeout: bool = False,
     ):
         self.url = f"{base_url.rstrip('/')}/simulate"
         self.catalog = catalog
         self.profile = dict(profile or {})
         self.timeout = float(timeout_sec)
         self.max_retries = int(max_retries)
+        self.retry_on_timeout = bool(retry_on_timeout)
         if self.timeout <= 0 or self.max_retries < 0:
             raise ValueError("timeout_sec must be positive and max_retries nonnegative")
         self.environment = environment_enemy_ids(catalog, self.profile)
@@ -198,8 +208,10 @@ class PcrCalculatorClient:
                     if attempt == self.max_retries or not (exc.code in {408, 429} or exc.code >= 500):
                         raise SimulationError(f"{self.url}: HTTP {exc.code} {exc.reason}") from exc
             except (OSError, HTTPException) as exc:
-                if attempt == self.max_retries:
-                    raise SimulationError(f"{self.url}: {exc}") from exc
+                is_timeout = _is_timeout_error(exc)
+                if (is_timeout and not self.retry_on_timeout) or attempt == self.max_retries:
+                    error = SimulationTimeoutError if is_timeout else SimulationError
+                    raise error(f"{self.url}: {exc}") from exc
             except ValueError as exc:
                 raise SimulationError(f"{self.url}: invalid JSON response") from exc
         if not isinstance(data, list) or len(data) != len(requests):
@@ -372,7 +384,8 @@ class SimClient(PcrCalculatorClient):
 
     def __init__(self, base_url: str, catalog: FeatureCatalog, profile: Mapping[str, Any]):
         super().__init__(base_url, profile.get("timeout_sec", 120.0), profile.get("max_retries", 2),
-                         catalog=catalog, profile=profile)
+                         catalog=catalog, profile=profile,
+                         retry_on_timeout=bool(profile.get("retry_on_timeout", False)))
 
     def simulate_batch_single_runs(
         self, payloads_with_repeats: Iterable[tuple[Mapping[str, Any], int] | SimulationConfig] | None = None, *,
