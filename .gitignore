@@ -1,5 +1,4 @@
 # Databases & generated data
-*.db
 *.sqlite
 *.sqlite3
 /data/
@@ -7,9 +6,13 @@
 /artifacts/
 /output/
 /tmp_*
+*.onnx
+# Released deployment bundles (explicitly tracked; raw training/local artifacts remain ignored)
+!models/
+!models/**
+*.db
 *.jsonl
 *.parquet
-*.onnx
 *.pt
 *.pth
 

@@ -2,6 +2,14 @@
 
 `LimingjieNN` 是面向《公主连结 Re:Dive》（国服）黎明界高分上限场景的独立决策训练与规划仓库，定位为 `LimingjieDesktop`（`refactor/event-kernel`）上层策略模块的洁净替代实现。
 
+## 已发布模型（`s4_m2b_r1_seed43`）
+
+Round 1 发布版采用 `m2b_r1 / seed_43` 单模型，适用于国服锁定数据库 `202611131613` 的 5 层 D5。S5 封存集全局 AUROC **0.9914**、胜率 ECE **0.0085**。桌面 CPU 对 512 支候选队执行完整推荐的延迟为 **p95 53.54 ms**，双塔 ONNX 合计 **7.915 MiB**。
+
+克隆仓库后，将环境变量 `LIMINGJIE_NN_BUNDLE` 或 JVM 参数 `-Dlimingjie.nn.bundle` 指向 `models/s4_m2b_r1_seed43`。桌面加载器自动发现包内的 `feature_pack.json`。在桌面端打开「设置 → 运行环境 → 迷宫战斗价值估计 → 使用本地 ONNX 模型（下局生效）」。功能未启用或包校验失败时，桌面端使用规则评分。
+
+文件清单、张量契约、阈值和验证命令见 [models/s4_m2b_r1_seed43/README.md](models/s4_m2b_r1_seed43/README.md)。
+
 ## 核心架构（Level 1 + Path B 两层协作）
 
 1. **Level 1 · Two-Tower 晚交互双塔战斗网络 (`V_battle`)**
@@ -28,6 +36,8 @@ LimingjieNN/
 │   ├── sim_profile_highscore_cn.json   # 难度5/高分模拟与自适应复测配置
 │   ├── sampling_round0.json            # 6桶分层采样与边界探针配比
 │   └── critic_m0..m2b.json             # 4档消融实验配置
+├── models/
+│   └── s4_m2b_r1_seed43/              # Round 1 单模型 ONNX 发布包
 ├── src/labyrinth_nn/
 │   ├── catalog/{schema,build_catalog}.py
 │   ├── data/{sample_schema,sim_client,probe_simulator,sampler,dataset}.py
@@ -46,15 +56,15 @@ LimingjieNN/
 ### 1. 本地 Windows 环境校验（仅需 Python 3.11+ 标准库）
 
 ```powershell
-cd D:\Project\LimingjieNN
-$env:PYTHONPATH = "D:\Project\LimingjieNN\src"
+# 在 LimingjieNN 仓库根目录运行
+$env:PYTHONPATH = (Resolve-Path -LiteralPath ".\src").Path
 
 # 运行全套本地单测（含真实 master_cn.db 集成验证与 Path B 规划测试）
 python -m unittest discover -s tests -v
 
 # 从国服数据库生成特征目录（数据库文件本身不入库）
 python -m labyrinth_nn.catalog.build_catalog `
-  --db "D:\path\to\master_cn.db" `
+  --db ".\master_cn.db" `
   --out "artifacts/feature_pack.json"
 
 # 采样分布干跑验证
@@ -74,7 +84,7 @@ python -m labyrinth_nn.data.sampler `
 
 ## 后续接入 `LimingjieDesktop` 交接清单
 
-在把导出的 ONNX 模型与 Path B 规划逻辑接入 `LimingjieDesktop`（`refactor/event-kernel`）前，需同步完成三件事：
-1. **补齐 AlphaCoin 紧凑数字 OCR**：当前生产管线中 `observedAlphaCoin` 未稳定传值，接入前需在商店/事件/地图链路补齐金币 OCR 与局内收支账本。
-2. **遵守模块隔离与 SHA 锁**：在共享纯 Kotlin 层定义轻量策略 SPI（Android 保持零 ONNX 体积并默认回退规则引擎），仅在 `desktop:app` Worker 进程组装根注入 `<10MB` ONNX Runtime 实现（关闭 `memoryPatternOptimization` 并复用单 `OrtEnvironment`）。
-3. **上线冲榜策略前真机核实 3 条游戏语义**：`retire()` 扣票与可结算时点、老虎机 `23161/33161` 后续阶段 `condition_value` 是否净扣本金（可在 `marginal_eval` 一键切换 `deduct_condition_principal`）、以及事件战与 `50002` 免死在结算分项中的计数口径。
+1. **桌面加载与对齐已验证。** `BattleOnnxBundle` 加载器与 `BattleOnnxGoldenTest` 已在 `refactor/event-kernel` / `feat/nn-battle-engine` 验证通过。使用 ORT Java `1.21.0` 时，黄金对齐测试 2/2 通过。
+2. **金币未知路径可用于首批联调。** S5 全量遮蔽金币后，`gold_unknown` 的 Win Brier 只增加 `+0.00003`。生产管线的 `observedAlphaCoin` 仍需在商店、事件和地图链路补齐金币 OCR 与局内收支账本，供依赖金币的规划逻辑使用。
+3. **保留模块隔离与 SHA 锁。** 在共享纯 Kotlin 层定义轻量策略 SPI。Android 保持零 ONNX 体积并使用规则引擎。仅在 `desktop:app` Worker 进程组装根注入双塔 ONNX 实现，关闭 `memoryPatternOptimization` 并复用单个 `OrtEnvironment`。
+4. **上线冲榜策略前真机核实三项游戏语义。** 核对 `retire()` 扣票与可结算时点、老虎机 `23161/33161` 后续阶段 `condition_value` 是否净扣本金（`marginal_eval` 的 `deduct_condition_principal` 可切换口径），以及事件战与 `50002` 免死在结算分项中的计数口径。

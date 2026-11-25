@@ -10,7 +10,7 @@
 
 | 项 | 约定路径 / 地址 | 说明 |
 | :--- | :--- | :--- |
-| **GitHub 私有仓库** | `https://github.com/Flysky701/LimingjieNN`（`main` 分支） | 仅存放代码、配置、脚本、Notebook 与任务书 |
+| **GitHub 私有仓库** | `https://github.com/Flysky701/LimingjieNN`（`main` 分支） | 存放代码、配置、脚本、Notebook、任务书及按 4.4 节验收的模型发布包 |
 | **Colab 本地工作副本** | `/content/LimingjieNN-zip`、`/content/LimingjieNN-drive` 或 `/content/LimingjieNN` | 对应 Drive 的 `source.zip`、Drive 的 `repo/` 和私有 GitHub 克隆 |
 | **Google Drive 根目录** | `/content/drive/MyDrive/LimingjieNN/` | 持久化存储 DB、样本、Checkpoint 与导出包 |
 | ├ `master_cn.db` | `$DRIVE_ROOT/master_cn.db` | 离线锁定国服主库（`BossVersionCN=202611131613`，见 `configs/sim_profile_highscore_cn.json`）；**严禁入库 Git** |
@@ -40,7 +40,7 @@ export CN_DB_VERSION="202611131613"
 
 ## 2. 阶段进度看板（监督 Agent 状态基准）
 
-未完成的阶段按实际产物和门禁验收。后续放量与训练按第 5 节执行。
+以下记录 Round 0 与 Round 1 的实际进度。第 5 节保留 Round 1 的执行方案与原定门禁。
 
 - [x] **Round 0 Pilot** · 北京时间 **2026-11-23 03:47** 完成。68 个分片包含 **25,000** 个唯一样本（44,155 个模拟子局）。`probe_round0.json` 记录 **13.02 sims/s**。胜出配置 `m2b` 的双塔 ONNX 合计 **7.91 MiB**，`max_abs_diff = 2.384e-6`。
   - `m2b` 与 `Quest-Only` 的 AUROC 分别为：`normal` **0.713 vs 0.771**（`normal` 上 `Quest-Only` 已超过 `m2b`，且测试集仅 18 个非胜样本）、`robot_ex` **0.769 vs 0.742**（`m2b` 仅领先 `+0.028`，且全猜胜准确率 `84.34%` 高于 `m2b` `83.87%`）。后续按同一关卡、库存与公会的配对候选队伍直接检验同上下文排序。
@@ -51,6 +51,16 @@ export CN_DB_VERSION="202611131613"
 - [x] **Phase 3 · Round 0 四档消融训练（`m0 -> m1 -> m2a -> m2b`）与独立温度校准**（`seed=42` 完成，`m2b` Global AUROC `0.94976`）
 - [x] **Phase 4 · Round 0 ONNX 双塔导出与 `< 1e-4` 数值对齐验收**（`7.91 MiB`，`max_abs_diff = 2.384e-6`）
 - [ ] **Phase 5 · Path B 离线真实地图回放基准（可选，依赖 `replays.jsonl`）**
+
+### Round 1
+
+- [x] **S0 · 前置核验**完成，锁定国服 DB `202611131613` 和对应特征目录。
+- [x] **S1 · 分层放量**完成，为开发集选型提供训练样本。
+- [x] **S2 · 选型与集成**完成，冻结上下文切分，保留 S2 三种子集成作为 S5 对照。
+- [x] **S3 · 主动挖掘**完成，S4 冻结切分的训练、选择、校准和测试集合计 **301,000 条**。
+- [x] **S4 · 训练与蒸馏门禁**完成。`m2b_r1` 与 `m2b_r1_dmg025` 各跑 3 个种子，`m2b_r1` 胜出。教师集成的胜率 Brier 改善 `0.00241 < 0.003`，Top-1 失败率降低 `0.796` 个百分点，低于 `1` 个百分点门槛，蒸馏未触发。部署选择 `seed_43` 的单模型。
+- [x] **S5 · 封存评估**完成，覆盖 **32,000 条**分层战绩与 **1,000 个配对上下文 × 8 支候选队**，Top-1 使用 **21 个独立种子**复测。全局 AUROC **0.9914**，胜率 ECE **0.0085**。在 779 个可行上下文中，`p_win >= 0.50` 时覆盖 744 个，失败 **14/744（1.88%）**。全量面板在该阈值下覆盖率为 **76.4%**，失败 **33/764（4.32%）**，原定推荐风险门禁未全部通过。桌面采用分档阈值与规则回退。
+- [x] **S4 ONNX 发布验收**完成。双塔 **8,299,348 字节（7.915 MiB）**，串联 `max_abs_diff = 7.629e-6`，桌面 CPU 的 512 候选完整推荐 **p95 53.54 ms**，Java 黄金对齐测试 **2/2** 通过。发布位置见 [models/s4_m2b_r1_seed43/](models/s4_m2b_r1_seed43/README.md)。
 
 ---
 
@@ -241,8 +251,9 @@ python -m labyrinth_nn.data.s0_preburn update-receipt \
 
 ### 4.4 Git 仓库卫生护栏
 
-- **严禁提交**任何 `*.db`、`*.sqlite*`、`*.jsonl`、`*.parquet`、`*.pt`、`*.pth`、`*.onnx`、Google OAuth 凭证或 Drive 本地缓存到 `Flysky701/LimingjieNN`（`.gitignore` 已拦截常见后缀，提交前仍须 `git status` 复核）。
-- 所有云端训练状态与模型产出统一落在 Google Drive `$DRIVE_ROOT`；仓库仅更新代码、配置与本 `TASK.md` 进度记录。
+- **仅允许纳入版本控制的模型产物**是完成封存评估与对齐验收的轻量化发布包，统一放在 `models/<release_id>/`，随包提供说明、特征目录和校验清单。
+- **严禁入库**原始数据库 `*.db`、`*.sqlite*`，采样文件 `*.jsonl`、`*.parquet`，PyTorch 权重 `*.pt`、`*.pth`，未验收的临时 `*.onnx`，以及 Google OAuth 凭证与 Drive 本地缓存。提交前用 `git status` 复核。
+- 云端训练状态、中间产物和未发布导出包统一保存在 Google Drive `$DRIVE_ROOT`。
 
 ## 5. 30 CC Optimal Plan
 
